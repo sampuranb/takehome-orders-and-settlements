@@ -19,6 +19,7 @@ use leptos_router::hooks::use_params_map;
 use leptos_router::path;
 
 use crate::auth::{provide_auth, AccountNav, AuthPage, Protected};
+use crate::orders::OrderEditor;
 
 /// Renders the full HTML document for every server-rendered response.
 ///
@@ -271,7 +272,7 @@ fn DashboardPage() -> impl IntoView {
                 "Focus target"
                 <input type="text" placeholder="Tab to me to check the focus ring" />
             </label>
-            <FieldError message="Field errors render like this." />
+            <FieldError message=Some("Field errors render like this.".to_string()) />
         </article>
     }
 }
@@ -290,7 +291,8 @@ fn NewOrderPage() -> impl IntoView {
     view! {
         <Title text="New order - Orders and Settlements" />
         <h1>"New order"</h1>
-        <p>"The line-item editor and server-side totals arrive in Feature 4."</p>
+        <p>"Totals are calculated on the server from the values you enter here."</p>
+        <OrderEditor />
     }
 }
 
@@ -351,15 +353,23 @@ pub fn MoneyText(cents: i64) -> impl IntoView {
 ///
 /// `role="alert"` so a message appearing after a failed submission is announced
 /// without moving focus away from the field the user is correcting.
+///
+/// The prop is a `Signal` rather than a plain `Option<String>` because the
+/// message arrives *after* the render that drew the field: a form submits, the
+/// server answers, and the message has to appear without the surrounding input
+/// being rebuilt and losing focus. `into` still accepts a literal `Option` for
+/// the static cases.
 #[component]
-pub fn FieldError(#[prop(optional, into)] message: Option<String>) -> impl IntoView {
-    message.map(|message| {
-        view! {
-            <small class="field-error" role="alert">
-                {message}
-            </small>
-        }
-    })
+pub fn FieldError(#[prop(into)] message: Signal<Option<String>>) -> impl IntoView {
+    move || {
+        message.get().map(|message| {
+            view! {
+                <small class="field-error" role="alert">
+                    {message}
+                </small>
+            }
+        })
+    }
 }
 
 /// Formats a signed cent amount as `-$1,234.56`.

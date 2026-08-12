@@ -54,6 +54,27 @@ pub enum AppError {
     #[error("{0}")]
     AuthRejected(String),
 
+    /// One or more submitted fields were not acceptable.
+    ///
+    /// Carries every failure at once, keyed by field, rather than stopping at
+    /// the first. A form that reports one problem per round trip makes the user
+    /// discover the rest by trial.
+    ///
+    /// Named to match its [`Self::code`] exactly. The serde tag on this enum is
+    /// derived from the variant name and is what a Rust client decodes, while
+    /// `code()` is what the REST surface returns — two names for one condition
+    /// would make them look like two conditions.
+    #[error("{}", validation_summary(.0))]
+    ValidationFailed(Vec<FieldError>),
+
+    /// A computed amount left the range this application can represent.
+    ///
+    /// Reached only through `checked_mul`/`checked_add` on `i64` cents, so it
+    /// is the *reason* those operations exist rather than an afterthought: the
+    /// alternative to this error is a total that silently wrapped negative.
+    #[error("That amount is too large. Keep the order total below $92,233,720,368,547,758.")]
+    AmountOutOfRange,
+
     /// The server function framework failed before or after our code ran —
     /// a network drop mid-submit, or a response it could not decode. Carries
     /// the framework's own description because there is nothing server-side to
@@ -71,8 +92,27 @@ impl AppError {
             Self::Unauthenticated => "UNAUTHENTICATED",
             Self::ForbiddenOrigin => "FORBIDDEN_ORIGIN",
             Self::AuthRejected(_) => "AUTH_REJECTED",
+            Self::ValidationFailed(_) => "VALIDATION_FAILED",
+            Self::AmountOutOfRange => "AMOUNT_OUT_OF_RANGE",
             Self::Transport(_) => "TRANSPORT",
         }
+    }
+
+    /// The per-field failures behind a [`Self::ValidationFailed`], for a form to
+    /// attach to the inputs that caused them. Empty for every other variant.
+    pub fn field_errors(&self) -> &[FieldError] {
+        match self {
+            Self::ValidationFailed(errors) => errors,
+            _ => &[],
+        }
+    }
+
+    /// The message for one field, if this error mentions it.
+    pub fn message_for(&self, field: &str) -> Option<&str> {
+        self.field_errors()
+            .iter()
+            .find(|error| error.field == field)
+            .map(|error| error.message.as_str())
     }
 
     /// HTTP status for the REST surface and for SSR error responses.
@@ -82,8 +122,48 @@ impl AppError {
             Self::DependencyUnavailable(_) => 503,
             Self::Unauthenticated => 401,
             Self::ForbiddenOrigin => 403,
-            Self::AuthRejected(_) => 400,
+            Self::AuthRejected(_) | Self::ValidationFailed(_) | Self::AmountOutOfRange => 400,
         }
+    }
+}
+
+/// One field, one reason it was rejected.
+///
+/// `field` is a stable machine-readable path, not a label: `customer`,
+/// `due_date`, or `items[2].quantity`. The browser matches on it to put the
+/// message next to the right input, and the REST surface returns it unchanged
+/// so a non-browser client can do the same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldError {
+    pub field: String,
+    pub message: String,
+}
+
+impl FieldError {
+    pub fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Renders a validation error as one sentence, for the places that can only
+/// show a single string: a log line, a REST `message`, or a plain-text client.
+/// The structured list is always available alongside it.
+fn validation_summary(errors: &[FieldError]) -> String {
+    match errors {
+        [] => "The submitted values were not accepted.".to_string(),
+        [only] => only.message.clone(),
+        _ => format!(
+            "{} fields need attention: {}",
+            errors.len(),
+            errors
+                .iter()
+                .map(|error| error.field.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

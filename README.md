@@ -98,12 +98,13 @@ cannot serve.
 | `POST` | `/api/sign_in*` | Server function: exchange credentials for a session cookie |
 | `POST` | `/api/sign_out*` | Server function: revoke the session |
 | `POST` | `/api/current_user*` | Server function: resolve the caller's identity |
+| `POST` | `/api/create_order*` | Server function: validate and persist an order (JSON body) |
 | `GET` | `/pkg/*` | Hydration bundle and stylesheet |
 
 Application pages are server-rendered and then hydrated. Unmatched paths return
 `404` with the same shell. `/auth` is the only public page; everything else is
-gated. The order pages are placeholders until their features land; the REST API
-for orders and payments arrives with those features.
+gated. The order list and detail pages are placeholders until their features
+land; the REST API for orders and payments arrives with those features.
 
 Server-function paths carry a generated suffix, so the exact URLs are read from
 the rendered `<form action>` rather than hard-coded.
@@ -134,6 +135,36 @@ cross-site form `POST`, so a cookie alone is never treated as authority to act.
 
 No cookie, token, or password is ever logged.
 
+## Money
+
+Every amount is an `i64` count of cents, from the moment it is parsed to the
+`BIGINT` column it lands in. No floating point, no `NUMERIC`, and no rounding
+step — there is nothing to round. Postgres `BIGINT` and Rust `i64` have exactly
+the same range, so a value that survives validation is representable in the
+database and back again.
+
+The money field accepts what a person types: `1234.50`, `$1,234.50`, `1234`,
+`.50`, `1234.5`. It refuses negatives, three or more decimal places, and
+anything else non-numeric, because silently dropping a third digit is how a cent
+goes missing.
+
+Every multiplication and addition is checked. Overflow is not a realistic
+invoice, but the alternative to a checked operation is a total that wraps
+negative, and a billing system that turns positive inputs into a negative total
+is worse than one that refuses the input.
+
+`src/orders.rs` compiles the parsers and the arithmetic for **both** targets, so
+the running total in the browser is a preview of the server's answer rather than
+a second implementation of it. The browser's number is never submitted:
+`create_order` re-parses the raw strings and recomputes everything server-side.
+
+Validation reports every problem in one response, keyed by field
+(`customer`, `due_date`, `items[2].quantity`), so a form does not make the user
+discover the rest by trial. An order and its line items are written in one
+transaction: the stored `total_cents` describes rows in another table, which no
+`CHECK` constraint can see, so the transaction is the only thing holding that
+invariant.
+
 ## Third-party assets
 
 `style/main.css` begins with [Pico CSS](https://picocss.com) v2.1.1, vendored
@@ -147,21 +178,34 @@ comment. The notice is retained here and in the source file.
 ## Tests
 
 ```bash
+set -a; . ./.env; set +a
 cargo fmt --check
 cargo clippy --features ssr --no-default-features --all-targets -- -D warnings
 cargo test --features ssr --no-default-features
 cargo leptos build
 ```
 
-`tests/auth.rs` drives the Better Auth contract against `wiremock` rather than
-the live service, because the cases that matter most are the ones a healthy Node
-process will not produce on demand: an outage, a refused connection, a rotated
-session cookie, a malformed body, and a rejected origin.
+`DATABASE_URL` must be set, and the database must be running: `tests/orders.rs`
+exercises real PostgreSQL behaviour — the `CHECK` constraints, the cascade, and
+the all-or-nothing write — and a fake would only re-assert what the test file
+already believes. Each test writes under an owner id no other test uses, so they
+run in parallel and clean up only their own rows.
 
-The foundation and the auth flow were also verified against the live service and
-a real browser: sign-up, sign-in, sign-out, cookie re-emission on this origin,
-revoked and forged sessions, the same-origin gate, and hydrated navigation
-without a full page load.
+`tests/auth.rs` goes the other way and drives the Better Auth contract against
+`wiremock` rather than the live service, because the cases that matter most are
+the ones a healthy Node process will not produce on demand: an outage, a refused
+connection, a rotated session cookie, a malformed body, and a rejected origin.
+
+The foundation, the auth flow, and order creation were also verified against the
+live service, a real browser, and the database: sign-up, sign-in, sign-out,
+cookie re-emission on this origin, revoked and forged sessions, the same-origin
+gate, hydrated navigation without a full page load, a multi-row order editor
+with a live total, and the stored cent values read back out of Postgres.
+
+`create_order` was additionally exercised with `curl`, which is the only way to
+see the status line rather than the decoded body: `403 FORBIDDEN_ORIGIN` with a
+missing or foreign `Origin`, `401 UNAUTHENTICATED` with no session, and
+`400 VALIDATION_FAILED` carrying every field message for a bad submission.
 
 ## Current status
 
@@ -177,11 +221,14 @@ Implemented:
 - Session cookie re-emission, including rotated and clearing cookies
 - Rust-side same-origin check on every state-changing server function
 - Gated routes and a server-side `require_user` gate for later features
+- Orders and line items: schema, integer-cent money, validation, and creation
+- A dynamic line-item editor with a live total computed by the server's own code
 
 Not yet implemented:
 
-- Orders and line items, payments, derived status
-- Dashboard, order detail, REST API
+- Order list, edit, and delete; derived status
+- Payments, amount due, and payment history
+- Dashboard and status filter; REST API
 - Deployment and the deployed URL
 
 ## License

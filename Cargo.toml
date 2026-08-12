@@ -15,6 +15,19 @@ leptos_router = "0.8.15"
 leptos_meta = "0.8.6"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
+# Calendar dates and order ids appear in server-function arguments and return
+# types, so both crates are shared by the two targets. Their clock and
+# random-number features are NOT: `chrono/clock` and `uuid/v7` are switched on
+# from the `ssr` list below, because cargo-leptos runs two separate builds and a
+# feature named there is only active in the native one.
+#
+# This is not a style preference. Enabling `uuid/v7` unconditionally fails the
+# wasm build outright — uuid refuses to compile for wasm32-unknown-unknown
+# without an explicit randomness source — and chrono's default `wasmbind`
+# feature would drag wasm-bindgen and js-sys into the bundle for a clock the
+# browser never reads. Today is decided on the server.
+chrono = { version = "0.4.45", default-features = false, features = ["serde"] }
+uuid = { version = "1.24.0", default-features = false, features = ["serde"] }
 
 # Server-only (`ssr`). Marked optional so none of it reaches the WASM bundle.
 leptos_axum = { version = "0.8.10", optional = true }
@@ -26,6 +39,10 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "postgres",
     "macros",
     "migrate",
+    # Teaches SQLx to decode Postgres UUID and DATE columns. Without these the
+    # first query that binds a `Uuid` or a `NaiveDate` fails to compile.
+    "uuid",
+    "chrono",
 ], optional = true }
 # Pinned to 0.6 on purpose: leptos_axum 0.8 and axum 0.8 both depend on
 # tower-http ^0.6, so 0.7 would compile a second copy of the crate into the
@@ -90,6 +107,10 @@ ssr = [
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",
+    # Server-only capabilities of two crates that are otherwise shared. See the
+    # comment on `chrono` above for why these live here and not up there.
+    "chrono/clock",
+    "uuid/v7",
 ]
 
 [package.metadata.leptos]

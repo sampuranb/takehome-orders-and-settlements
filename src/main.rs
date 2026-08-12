@@ -26,7 +26,7 @@ use axum::{
     Json, Router,
 };
 #[cfg(feature = "ssr")]
-use leptos::prelude::{get_configuration, LeptosOptions};
+use leptos::prelude::{get_configuration, provide_context, LeptosOptions};
 #[cfg(feature = "ssr")]
 use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
 #[cfg(feature = "ssr")]
@@ -230,15 +230,24 @@ fn build_router(state: AppState) -> Router {
     // them directly instead of falling through to the 404 handler.
     let routes = generate_route_list(App);
     let shell_options = state.leptos_options.clone();
+    let pool = state.pool.clone();
 
     Router::new()
         .route("/health", get(health))
         // Registers the discovered SSR routes *and*, automatically, every
-        // `#[server]` function endpoint (integrations/axum/src/lib.rs:1826).
-        // It also calls `provide_context::<AppState>(state)` internally, so
-        // server functions in later features reach the pool and the auth base
-        // URL with `use_context::<AppState>()` and no extra wiring here.
-        .leptos_routes(&state, routes, move || shell(shell_options.clone()))
+        // `#[server]` function endpoint (integrations/axum/src/lib.rs:1826),
+        // providing the context closure to both.
+        //
+        // `AppState` is defined in this binary crate, which the library cannot
+        // name, so the pool is provided as a bare `PgPool` — the one type both
+        // sides already share. `orders::ssr::pool()` is the only reader.
+        // Cloning a `PgPool` clones a handle, not a connection.
+        .leptos_routes_with_context(
+            &state,
+            routes,
+            move || provide_context(pool.clone()),
+            move || shell(shell_options.clone()),
+        )
         // Serves files from `site_root`, then renders the shell with a 404 for
         // anything that is neither a file nor a known route.
         .fallback(file_and_error_handler::<AppState, _>(shell))
