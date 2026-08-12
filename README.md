@@ -4,9 +4,9 @@ Full-stack Rust application for creating orders with line items, recording full
 or partial payments against them, and viewing a dashboard of derived status and
 amounts due.
 
-> **Status: in progress.** The foundation is complete and verified. Orders,
-> payments, the dashboard, and the REST API are not implemented yet. See
-> [Current status](#current-status).
+> **Status: in progress.** The foundation and authentication are complete and
+> verified. Orders, payments, the dashboard, and the REST API are not
+> implemented yet. See [Current status](#current-status).
 
 ## Stack
 
@@ -56,14 +56,18 @@ automatically and passes it to the server process.
 cp .env.example .env
 ```
 
-Start the development server. It rebuilds on change and serves at the address
-in `LEPTOS_SITE_ADDR`, defaulting to `127.0.0.1:3000`.
+Start the development server.
 
 ```bash
 cargo leptos serve
 ```
 
 Migrations run automatically at startup, so no separate migrate step is needed.
+
+Then browse to **<http://localhost:5174>** — `localhost`, not `127.0.0.1`. The
+two are different origins to both the browser and Better Auth, and the shared
+auth service only trusts `http://localhost:5174`. Signing out from any other
+origin is refused with `403`.
 
 ## Configuration
 
@@ -89,11 +93,46 @@ cannot serve.
 | `GET` | `/orders` | Order list |
 | `GET` | `/orders/new` | Order editor |
 | `GET` | `/orders/:id` | Order detail |
+| `GET` | `/auth` | Sign in and sign up |
+| `POST` | `/api/sign_up*` | Server function: register, then sign in |
+| `POST` | `/api/sign_in*` | Server function: exchange credentials for a session cookie |
+| `POST` | `/api/sign_out*` | Server function: revoke the session |
+| `POST` | `/api/current_user*` | Server function: resolve the caller's identity |
 | `GET` | `/pkg/*` | Hydration bundle and stylesheet |
 
 Application pages are server-rendered and then hydrated. Unmatched paths return
-`404` with the same shell. The pages are placeholders until their features land;
-the REST API for orders and payments arrives with those features.
+`404` with the same shell. `/auth` is the only public page; everything else is
+gated. The order pages are placeholders until their features land; the REST API
+for orders and payments arrives with those features.
+
+Server-function paths carry a generated suffix, so the exact URLs are read from
+the rendered `<form action>` rather than hard-coded.
+
+## Authentication
+
+The shared Better Auth service is the only authority on identity. This
+application stores no sessions, hashes no passwords, and mints no tokens. It
+forwards the browser's cookie to Better Auth on each request and re-emits every
+`Set-Cookie` header it gets back, which is what scopes the session cookie to
+this origin without CORS. Better Auth's opaque `user.id` is the tenant key that
+orders will be filtered by.
+
+Three parts of the contract are worth knowing before reading `src/auth.rs`:
+
+| Observation | Better Auth's answer | Handled as |
+| --- | --- | --- |
+| Missing, expired, or forged session | `200` with a JSON `null` body | Signed out (`401` when a page requires a user) |
+| Auth service unreachable or `5xx` | connection error / `5xx` | `503`, never "signed out" |
+| Sign-out without a trusted `Origin` | `403 MISSING_OR_NULL_ORIGIN` | `403`; the browser's own origin is validated and forwarded |
+
+Sign-out returns **three** `Set-Cookie` headers, each re-emitted individually.
+
+State-changing server functions run their own same-origin check in Rust before
+any credential leaves the process, independently of Better Auth's trusted-origin
+list. The session cookie is `SameSite=Lax`, which still permits a top-level
+cross-site form `POST`, so a cookie alone is never treated as authority to act.
+
+No cookie, token, or password is ever logged.
 
 ## Third-party assets
 
@@ -109,14 +148,20 @@ comment. The notice is retained here and in the source file.
 
 ```bash
 cargo fmt --check
-cargo clippy --features ssr --no-default-features -- -D warnings
+cargo clippy --features ssr --no-default-features --all-targets -- -D warnings
+cargo test --features ssr --no-default-features
 cargo leptos build
 ```
 
-Automated test coverage begins with the authentication feature. The foundation
-was verified manually: startup validation branches, health success and failure,
-server-rendered output, hydration in a browser, and graceful shutdown on
-SIGTERM.
+`tests/auth.rs` drives the Better Auth contract against `wiremock` rather than
+the live service, because the cases that matter most are the ones a healthy Node
+process will not produce on demand: an outage, a refused connection, a rotated
+session cookie, a malformed body, and a rejected origin.
+
+The foundation and the auth flow were also verified against the live service and
+a real browser: sign-up, sign-in, sign-out, cookie re-emission on this origin,
+revoked and forged sessions, the same-origin gate, and hydrated navigation
+without a full page load.
 
 ## Current status
 
@@ -128,10 +173,13 @@ Implemented:
 - Database-backed health endpoint with a distinct unavailable response
 - Server-rendered shell with working browser hydration
 - Structured tracing, response compression, and graceful shutdown
+- Sign-up, sign-in, and sign-out against the shared Better Auth service
+- Session cookie re-emission, including rotated and clearing cookies
+- Rust-side same-origin check on every state-changing server function
+- Gated routes and a server-side `require_user` gate for later features
 
 Not yet implemented:
 
-- Authentication against the shared Better Auth service
 - Orders and line items, payments, derived status
 - Dashboard, order detail, REST API
 - Deployment and the deployed URL

@@ -37,10 +37,41 @@ tower-http = { version = "0.6.11", features = [
 ], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# One HTTP client for the shared Better Auth service.
+#
+# `default-features = false` is load-bearing. reqwest 0.13's default `rustls`
+# feature selects the aws-lc-rs crypto backend, while sqlx's `tls-rustls`
+# resolves to `tls-rustls-ring`. Taking the default would compile *two* crypto
+# providers into one binary and leave rustls unable to pick a process default.
+# `rustls-no-provider` lets Cargo's feature unification settle on the single
+# provider sqlx already enabled: ring.
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "json",
+    "rustls-no-provider",
+], optional = true }
+# Not a second TLS stack: this is the same rustls 0.23 sqlx and reqwest already
+# share, named directly only so the process can install ring as *the* crypto
+# provider. `rustls-no-provider` above deliberately declines to choose one, and
+# reqwest panics at `Client::build` until something does.
+rustls = { version = "0.23.43", default-features = false, features = [
+    "ring",
+], optional = true }
+# Already in the tree via reqwest's `json` feature; declared explicitly because
+# src/auth.rs parses Better Auth's bodies by hand. `get-session` answers `200`
+# with a bare `null` for a signed-out visitor, so the body has to be inspected
+# before it is deserialized rather than piped straight through `Response::json`.
+serde_json = { version = "1.0", optional = true }
 
 # Browser-only (`hydrate`).
 wasm-bindgen = { version = "0.2.127", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Stands in for the shared Better Auth service so its contract can be tested
+# without running Node, including failure modes a live service will not produce
+# on demand (outage, malformed body, refreshed cookie).
+wiremock = "0.6.5"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = []
@@ -53,6 +84,9 @@ ssr = [
     "dep:tower-http",
     "dep:tracing",
     "dep:tracing-subscriber",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:serde_json",
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",
@@ -63,7 +97,11 @@ ssr = [
 output-name = "orders"
 site-root = "target/site"
 site-pkg-dir = "pkg"
-site-addr = "127.0.0.1:3000"
+# Port 5174 is not arbitrary: the shared Better Auth service reserves
+# http://localhost:5174 for this application in its TRUSTED_ORIGINS, and it
+# rejects sign-out from any other origin. Browse to localhost, not 127.0.0.1 —
+# they are different origins to both the browser and Better Auth.
+site-addr = "127.0.0.1:5174"
 reload-port = 3001
 bin-features = ["ssr"]
 bin-default-features = false

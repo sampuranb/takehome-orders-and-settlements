@@ -6,6 +6,7 @@
 //! belongs behind `#[cfg(feature = "ssr")]`.
 
 pub mod app;
+pub mod auth;
 pub mod error;
 
 // Re-exported at the crate root so `main.rs` keeps importing the document shell

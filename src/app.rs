@@ -18,6 +18,8 @@ use leptos_router::components::{Outlet, ParentRoute, Route, Router, Routes, A};
 use leptos_router::hooks::use_params_map;
 use leptos_router::path;
 
+use crate::auth::{provide_auth, AccountNav, AuthPage, Protected};
+
 /// Renders the full HTML document for every server-rendered response.
 ///
 /// `HydrationScripts` emits the `<script>` tags that load `/pkg/orders.js`,
@@ -53,6 +55,11 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+    // One auth context for the whole tree. Created here rather than inside
+    // `Shell` so the header, the protected pages, and the auth page all read
+    // the same identity and the same three actions, and so signing in or out
+    // invalidates every one of them at once.
+    provide_auth();
 
     view! {
         // cargo-leptos always publishes the processed `style-file` at
@@ -64,6 +71,12 @@ pub fn App() -> impl IntoView {
 
         <Router>
             <Routes fallback=NotFound>
+                // Sits outside the layout parent on purpose: everything under
+                // that parent is gated by `Protected`, and the page you are
+                // sent to when you are not signed in must not be. It renders
+                // its own `Chrome`, exactly as `NotFound` does.
+                <Route path=path!("auth") view=AuthGate />
+
                 // The parent contributes no path segment: it exists purely to
                 // wrap every page in the persistent layout. It produces no
                 // route of its own — only the flattened leaves below are
@@ -79,10 +92,30 @@ pub fn App() -> impl IntoView {
     }
 }
 
+/// The auth page inside the shared chrome.
+///
+/// A thin wrapper rather than putting `Chrome` inside `AuthPage` itself: the
+/// chrome is this module's concern, and `src/auth.rs` should not have to know
+/// what the surrounding page furniture is.
+#[component]
+fn AuthGate() -> impl IntoView {
+    view! {
+        <Chrome>
+            <AuthPage />
+        </Chrome>
+    }
+}
+
 /// Persistent layout: skip link, header navigation, error boundary, outlet.
 ///
 /// Rendered once as the parent of every page, so client-side navigation swaps
 /// only the `<Outlet/>` contents and leaves the header and footer DOM untouched.
+///
+/// `Protected` wraps the outlet rather than each page, so a route added in a
+/// later feature is private by default. Forgetting to gate a new page is the
+/// easy mistake, and this makes the easy path the safe one — though the real
+/// boundary is still `require_user` inside each server function, since anything
+/// the browser decides can be skipped by not using a browser.
 #[component]
 fn Shell() -> impl IntoView {
     view! {
@@ -106,7 +139,9 @@ fn Shell() -> impl IntoView {
                     </article>
                 }
             }>
-                <Outlet />
+                <Protected>
+                    <Outlet />
+                </Protected>
             </ErrorBoundary>
         </Chrome>
     }
@@ -149,6 +184,10 @@ fn Chrome(children: Children) -> impl IntoView {
                     <li>
                         <A href="/orders/new">"New order"</A>
                     </li>
+                    // Resolves asynchronously and renders nothing until it
+                    // does, so the rest of the navigation never waits on the
+                    // auth service to become interactive.
+                    <AccountNav />
                 </ul>
             </nav>
         </header>
