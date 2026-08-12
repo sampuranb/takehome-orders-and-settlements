@@ -23,10 +23,14 @@
 use chrono::NaiveDate;
 use leptos::server_fn::error::FromServerFnError;
 use orders_and_settlements::error::AppError;
-use orders_and_settlements::orders::ssr::{create_order_service, insert_order};
+use orders_and_settlements::orders::ssr::{
+    create_order_service, delete_order_service, find_order_for_user, insert_order,
+    list_orders_for_user, update_order_service,
+};
 use orders_and_settlements::orders::{
-    calculate_line_total_cents, calculate_order_total_cents, validate_create_order, NewOrderInput,
-    OrderItemInput, ValidatedItem, ValidatedOrder, MAX_ITEMS,
+    calculate_line_total_cents, calculate_order_total_cents, derive_order_status,
+    validate_create_order, NewOrderInput, OrderItemInput, OrderStatus, ValidatedItem,
+    ValidatedOrder, MAX_ITEMS,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -275,6 +279,80 @@ fn a_total_that_overflows_is_not_a_field_error() {
 }
 
 // ---------------------------------------------------------------------------
+// Derived status
+//
+// `derive_order_status` takes `today` as a parameter, so every branch is
+// reachable without waiting for a date to arrive or stubbing a clock.
+// ---------------------------------------------------------------------------
+
+fn day(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).expect("a real calendar date")
+}
+
+#[test]
+fn an_unpaid_order_before_its_due_date_is_pending() {
+    let status = derive_order_status(10_000, 0, day(2026, 9, 30), day(2026, 8, 13));
+
+    assert_eq!(status, OrderStatus::Pending);
+}
+
+#[test]
+fn a_partly_paid_order_before_its_due_date_is_partially_paid() {
+    let status = derive_order_status(10_000, 4_000, day(2026, 9, 30), day(2026, 8, 13));
+
+    assert_eq!(status, OrderStatus::PartiallyPaid);
+}
+
+#[test]
+fn an_order_paid_in_full_is_paid() {
+    let status = derive_order_status(10_000, 10_000, day(2026, 9, 30), day(2026, 8, 13));
+
+    assert_eq!(status, OrderStatus::Paid);
+}
+
+#[test]
+fn an_order_is_overdue_only_after_its_due_date_has_passed() {
+    let due = day(2026, 8, 13);
+
+    // The due date itself is not late. An invoice due today is due today.
+    assert_eq!(
+        derive_order_status(10_000, 0, due, due),
+        OrderStatus::Pending
+    );
+    assert_eq!(
+        derive_order_status(10_000, 0, due, day(2026, 8, 14)),
+        OrderStatus::Overdue
+    );
+}
+
+#[test]
+fn paid_beats_overdue() {
+    // The precedence that matters: an order settled after its due date is
+    // finished, not outstanding. Nobody should be chased for it.
+    let status = derive_order_status(10_000, 10_000, day(2026, 1, 1), day(2026, 8, 13));
+
+    assert_eq!(status, OrderStatus::Paid);
+}
+
+#[test]
+fn overdue_beats_partially_paid() {
+    // The other precedence: money is still owed past the date, so the order is
+    // overdue even though something was paid against it.
+    let status = derive_order_status(10_000, 4_000, day(2026, 1, 1), day(2026, 8, 13));
+
+    assert_eq!(status, OrderStatus::Overdue);
+}
+
+#[test]
+fn an_overpaid_order_is_paid_not_partially_paid() {
+    // Feature 6 refuses overpayment, but the comparison is `>=` rather than
+    // `==` so a total that was later reduced cannot leave the order stuck.
+    let status = derive_order_status(10_000, 12_000, day(2026, 1, 1), day(2026, 8, 13));
+
+    assert_eq!(status, OrderStatus::Paid);
+}
+
+// ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 
@@ -387,31 +465,6 @@ async fn a_rejected_line_item_rolls_back_the_whole_order() {
 }
 
 #[tokio::test]
-async fn deleting_an_order_takes_its_line_items_with_it() {
-    let pool = connect().await;
-    let owner = test_owner();
-
-    let order_id =
-        create_order_service(&pool, &owner, &order(vec![item("Consulting", "1", "1.00")]))
-            .await
-            .expect("the order is valid");
-
-    sqlx::query("DELETE FROM orders WHERE id = $1")
-        .bind(order_id)
-        .execute(&pool)
-        .await
-        .expect("the order is deleted");
-
-    let orphans: i64 = sqlx::query_scalar("SELECT count(*) FROM order_items WHERE order_id = $1")
-        .bind(order_id)
-        .fetch_one(&pool)
-        .await
-        .expect("the count query runs");
-
-    assert_eq!(orphans, 0);
-}
-
-#[tokio::test]
 async fn two_owners_writing_at_once_stay_separate() {
     let pool = connect().await;
     let first = test_owner();
@@ -438,4 +491,286 @@ async fn two_owners_writing_at_once_stay_separate() {
 
     cleanup(&pool, &first).await;
     cleanup(&pool, &second).await;
+}
+
+// ---------------------------------------------------------------------------
+// Reads, edits, and deletes
+//
+// Every one of these goes through the same `owner_user_id` filter the server
+// functions use. The tests that matter most are the ones where a second owner
+// asks for the first owner's order: the answer must be indistinguishable from
+// asking for an id that was never written.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lists_only_the_callers_orders_soonest_due_first() {
+    let pool = connect().await;
+    let owner = test_owner();
+    let stranger = test_owner();
+
+    let mut later = order(vec![item("Consulting", "1", "10.00")]);
+    later.due_date = "2026-12-01".to_string();
+    later.customer = "Later Ltd".to_string();
+    let mut sooner = order(vec![
+        item("Licence", "2", "5.00"),
+        item("Support", "1", "1.00"),
+    ]);
+    sooner.due_date = "2026-09-01".to_string();
+    sooner.customer = "Sooner Ltd".to_string();
+
+    create_order_service(&pool, &owner, &later)
+        .await
+        .expect("the later order is valid");
+    create_order_service(&pool, &owner, &sooner)
+        .await
+        .expect("the sooner order is valid");
+    create_order_service(&pool, &stranger, &order(vec![item("Other", "1", "1.00")]))
+        .await
+        .expect("the stranger's order is valid");
+
+    let listed = list_orders_for_user(&pool, &owner)
+        .await
+        .expect("the list is readable");
+
+    assert_eq!(listed.len(), 2, "the stranger's order must not appear");
+    assert_eq!(listed[0].customer, "Sooner Ltd");
+    assert_eq!(listed[1].customer, "Later Ltd");
+
+    // The item count comes from a join and a group-by, not a follow-up read.
+    assert_eq!(listed[0].item_count, 2);
+    assert_eq!(listed[1].item_count, 1);
+
+    // Until Feature 6 there are no payments, so everything is still due.
+    assert_eq!(listed[0].total_cents, 1_100);
+    assert_eq!(listed[0].paid_cents, 0);
+    assert_eq!(listed[0].amount_due_cents(), 1_100);
+
+    cleanup(&pool, &owner).await;
+    cleanup(&pool, &stranger).await;
+}
+
+#[tokio::test]
+async fn reads_one_order_with_its_items_in_the_order_they_were_entered() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let input = order(vec![
+        item("Consulting", "3", "19.99"),
+        item("Licence", "1", "$1,000.00"),
+    ]);
+    let order_id = create_order_service(&pool, &owner, &input)
+        .await
+        .expect("the order is valid");
+
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("the order is readable");
+
+    assert_eq!(detail.id, order_id);
+    assert_eq!(detail.customer, "Acme Corp");
+    assert_eq!(detail.total_cents, 105_997);
+    assert_eq!(detail.amount_due_cents(), 105_997);
+    assert!(detail.editable, "an order with no payments can be changed");
+
+    let descriptions: Vec<&str> = detail
+        .items
+        .iter()
+        .map(|line| line.description.as_str())
+        .collect();
+    assert_eq!(descriptions, vec!["Consulting", "Licence"]);
+    assert_eq!(detail.items[0].line_total_cents, 5_997);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn a_stranger_cannot_read_someone_elses_order() {
+    let pool = connect().await;
+    let owner = test_owner();
+    let stranger = test_owner();
+
+    let order_id = create_order_service(&pool, &owner, &order(vec![item("X", "1", "1.00")]))
+        .await
+        .expect("the order is valid");
+
+    let refused = find_order_for_user(&pool, &stranger, order_id)
+        .await
+        .expect_err("a stranger must not read it");
+
+    // The same answer an id that was never written gets. A `403` here would
+    // confirm to the stranger that this id exists.
+    assert_eq!(refused, AppError::NotFound);
+    assert_eq!(refused.status_code(), 404);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn an_id_that_was_never_written_is_not_found() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let missing = find_order_for_user(&pool, &owner, Uuid::now_v7())
+        .await
+        .expect_err("nothing was written under this id");
+
+    assert_eq!(missing, AppError::NotFound);
+}
+
+#[tokio::test]
+async fn an_edit_replaces_the_items_and_recomputes_the_total() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(
+        &pool,
+        &owner,
+        &order(vec![
+            item("Consulting", "3", "19.99"),
+            item("Licence", "1", "1000.00"),
+        ]),
+    )
+    .await
+    .expect("the order is valid");
+
+    let mut edited = order(vec![item("Support", "2", "25.00")]);
+    edited.customer = "Acme Holdings".to_string();
+    edited.due_date = "2026-10-15".to_string();
+
+    update_order_service(&pool, &owner, order_id, &edited)
+        .await
+        .expect("the edit is valid");
+
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("the order is still readable");
+
+    assert_eq!(detail.customer, "Acme Holdings");
+    assert_eq!(
+        detail.due_date,
+        NaiveDate::from_ymd_opt(2026, 10, 15).unwrap()
+    );
+    // Recomputed from the submitted strings, not adjusted from the old total.
+    assert_eq!(detail.total_cents, 5_000);
+    assert_eq!(detail.items.len(), 1, "the old items are gone, not merged");
+    assert_eq!(detail.items[0].description, "Support");
+
+    // The replaced rows were deleted rather than left orphaned, and the new one
+    // starts at position 0 again.
+    let positions: Vec<i32> = sqlx::query_scalar(
+        "SELECT position FROM order_items WHERE order_id = $1 ORDER BY position",
+    )
+    .bind(order_id)
+    .fetch_all(&pool)
+    .await
+    .expect("the items are readable");
+    assert_eq!(positions, vec![0]);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn an_invalid_edit_leaves_the_stored_order_untouched() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(
+        &pool,
+        &owner,
+        &order(vec![item("Consulting", "3", "19.99")]),
+    )
+    .await
+    .expect("the order is valid");
+
+    let refused = update_order_service(&pool, &owner, order_id, &order(vec![]))
+        .await
+        .expect_err("an order with no items is not valid");
+    assert_eq!(failed_fields(&refused), vec!["items"]);
+
+    // Validation runs before the transaction opens, so there is nothing to roll
+    // back — but the point of the test is what the caller can still read.
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("the order survived");
+    assert_eq!(detail.total_cents, 5_997);
+    assert_eq!(detail.items.len(), 1);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn a_stranger_cannot_edit_or_delete_someone_elses_order() {
+    let pool = connect().await;
+    let owner = test_owner();
+    let stranger = test_owner();
+
+    let order_id = create_order_service(&pool, &owner, &order(vec![item("X", "1", "1.00")]))
+        .await
+        .expect("the order is valid");
+
+    let edit = update_order_service(
+        &pool,
+        &stranger,
+        order_id,
+        &order(vec![item("Hijacked", "1", "0.01")]),
+    )
+    .await
+    .expect_err("a stranger must not edit it");
+    assert_eq!(edit, AppError::NotFound);
+
+    let delete = delete_order_service(&pool, &stranger, order_id)
+        .await
+        .expect_err("a stranger must not delete it");
+    assert_eq!(delete, AppError::NotFound);
+
+    // Neither attempt changed anything.
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("the owner's order is intact");
+    assert_eq!(detail.items[0].description, "X");
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn deleting_an_order_takes_its_line_items_with_it() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(
+        &pool,
+        &owner,
+        &order(vec![item("A", "1", "1.00"), item("B", "2", "2.00")]),
+    )
+    .await
+    .expect("the order is valid");
+
+    delete_order_service(&pool, &owner, order_id)
+        .await
+        .expect("the owner may delete it");
+
+    assert_eq!(
+        find_order_for_user(&pool, &owner, order_id)
+            .await
+            .expect_err("it is gone"),
+        AppError::NotFound
+    );
+
+    let orphans: i64 = sqlx::query_scalar("SELECT count(*) FROM order_items WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the count is readable");
+    assert_eq!(orphans, 0, "ON DELETE CASCADE removed the line items");
+
+    // A second delete is not an error the caller can distinguish from deleting
+    // a stranger's order, and must not be.
+    assert_eq!(
+        delete_order_service(&pool, &owner, order_id)
+            .await
+            .expect_err("it is already gone"),
+        AppError::NotFound
+    );
+
+    cleanup(&pool, &owner).await;
 }

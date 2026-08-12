@@ -24,13 +24,16 @@ use leptos::prelude::*;
 // Named by `#[server(input = Json)]` below, which expands to a bare `Json`
 // path and so needs the codec in scope on both targets.
 use leptos::server_fn::codec::Json;
-use leptos_router::hooks::use_navigate;
+use leptos_meta::Title;
+use leptos_router::components::A;
+use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::NavigateOptions;
 use serde::{Deserialize, Serialize};
 
 use chrono::NaiveDate;
 use uuid::Uuid;
 
-use crate::app::{FieldError, MoneyText};
+use crate::app::{FieldError, MoneyText, StatusBadge};
 use crate::error::{AppError, AppResult};
 
 /// Upper bound on line items in one order.
@@ -97,6 +100,133 @@ pub struct ValidatedOrder {
     pub due_date: NaiveDate,
     pub total_cents: i64,
     pub items: Vec<ValidatedItem>,
+}
+
+// ---------------------------------------------------------------------------
+// Read models
+//
+// What a page needs, rather than what a table holds. `status` and
+// `amount_due_cents` are computed on the server and sent down finished, so no
+// component can arrive at a different answer than the one the API reports.
+// ---------------------------------------------------------------------------
+
+/// One row of the order list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderSummary {
+    pub id: Uuid,
+    pub customer: String,
+    pub due_date: NaiveDate,
+    pub total_cents: i64,
+    pub paid_cents: i64,
+    pub item_count: i64,
+    pub status: OrderStatus,
+}
+
+impl OrderSummary {
+    pub fn amount_due_cents(&self) -> i64 {
+        self.total_cents.saturating_sub(self.paid_cents)
+    }
+}
+
+/// One line item as it is read back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderLine {
+    pub description: String,
+    pub quantity: i64,
+    pub unit_price_cents: i64,
+    pub line_total_cents: i64,
+}
+
+/// A whole order with its line items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderDetail {
+    pub id: Uuid,
+    pub customer: String,
+    pub due_date: NaiveDate,
+    pub total_cents: i64,
+    pub paid_cents: i64,
+    pub status: OrderStatus,
+    /// False once the order has a payment against it. The browser uses this to
+    /// hide the edit and delete controls; the server re-derives it inside the
+    /// transaction, because hiding a control is not the same as refusing one.
+    pub editable: bool,
+    pub items: Vec<OrderLine>,
+}
+
+impl OrderDetail {
+    pub fn amount_due_cents(&self) -> i64 {
+        self.total_cents.saturating_sub(self.paid_cents)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Derived status
+// ---------------------------------------------------------------------------
+
+/// Where an order stands. Never stored — always computed from the total, the
+/// payments against it, and today's date.
+///
+/// Storing it would create a second source of truth that goes stale on its own:
+/// an order becomes overdue because a day passed, with nothing writing to the
+/// database at all. There is no event to hang an update on, so there is nothing
+/// to store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    Pending,
+    PartiallyPaid,
+    Paid,
+    Overdue,
+}
+
+impl OrderStatus {
+    /// The stable wire form. Matches the serde representation and the value
+    /// `crate::app::StatusBadge` maps to a tone.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::PartiallyPaid => "partially_paid",
+            Self::Paid => "paid",
+            Self::Overdue => "overdue",
+        }
+    }
+}
+
+/// Derives an order's status. The only place this decision is made.
+///
+/// Precedence is paid, then overdue, then partially paid, then pending — and
+/// the order of those tests is the whole specification. Putting "paid" first is
+/// what makes a settled invoice stay settled after its due date passes: an
+/// order nobody owes anything on is not overdue, however old it is.
+///
+/// `today` and `paid_cents` are parameters rather than things this function
+/// fetches, which is what makes every branch reachable from a test without a
+/// clock or a database.
+pub fn derive_order_status(
+    total_cents: i64,
+    paid_cents: i64,
+    due_date: NaiveDate,
+    today: NaiveDate,
+) -> OrderStatus {
+    // `>=` rather than `==`: Feature 6 refuses overpayment, but if a row ever
+    // did carry more than the total, "paid" is the honest answer and an
+    // equality test would silently report it as partially paid.
+    //
+    // A zero-total order is therefore paid from the moment it exists, which is
+    // correct — there is nothing outstanding on it.
+    if paid_cents >= total_cents {
+        return OrderStatus::Paid;
+    }
+
+    if due_date < today {
+        return OrderStatus::Overdue;
+    }
+
+    if paid_cents > 0 {
+        return OrderStatus::PartiallyPaid;
+    }
+
+    OrderStatus::Pending
 }
 
 // ---------------------------------------------------------------------------
@@ -389,11 +519,77 @@ fn validate_item(
 
 #[cfg(feature = "ssr")]
 pub mod ssr {
-    use super::{validate_create_order, NewOrderInput, ValidatedOrder};
+    use super::{
+        derive_order_status, validate_create_order, NewOrderInput, OrderDetail, OrderLine,
+        OrderSummary, ValidatedOrder,
+    };
     use crate::error::{AppError, AppResult};
+    use chrono::{NaiveDate, Utc};
     use leptos::prelude::use_context;
-    use sqlx::{PgPool, QueryBuilder};
+    use sqlx::{PgConnection, PgPool, QueryBuilder};
     use uuid::Uuid;
+
+    /// The date the overdue rule compares against.
+    ///
+    /// UTC, and deliberately so. A due date is a calendar date with no time
+    /// zone attached to it, and this application stores no time zone for a user
+    /// or a customer to be correct relative to — so there is no local midnight
+    /// to prefer. One fixed reference that every request agrees on beats a
+    /// per-connection one; Postgres's `CURRENT_DATE` resolves against the
+    /// session's `timezone` setting and could quietly disagree with this.
+    ///
+    /// The single call site. `derive_order_status` takes `today` as a parameter
+    /// so every branch of it is reachable from a test without a clock.
+    fn today() -> NaiveDate {
+        Utc::now().date_naive()
+    }
+
+    // Three statements below project `paid_cents` as `0::BIGINT` and
+    // `has_payments` as `FALSE`. **Feature 6 replaces those two literals**,
+    // with
+    //
+    //   COALESCE((SELECT sum(amount_cents) FROM payments
+    //             WHERE payments.order_id = orders.id), 0)
+    //   EXISTS   (SELECT 1 FROM payments WHERE payments.order_id = orders.id)
+    //
+    // They are projected columns rather than Rust constants so the shape of
+    // each read — and of the row struct it decodes into — is already the shape
+    // Feature 6 needs. SQLx 0.9 only accepts `&'static str` as a statement, so
+    // they are written out in each query rather than interpolated from one
+    // constant; that also keeps every statement greppable as the SQL it is.
+
+    /// One row of the order list, as the database returns it.
+    ///
+    /// `sqlx::FromRow` lives on this type and not on [`OrderSummary`], which
+    /// crosses the wire to the browser: `sqlx` is an `ssr`-only dependency, and
+    /// a derive that names it would fail to resolve in the wasm build.
+    #[derive(sqlx::FromRow)]
+    struct SummaryRow {
+        id: Uuid,
+        customer: String,
+        due_date: NaiveDate,
+        total_cents: i64,
+        paid_cents: i64,
+        item_count: i64,
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct OrderRow {
+        id: Uuid,
+        customer: String,
+        due_date: NaiveDate,
+        total_cents: i64,
+        paid_cents: i64,
+        has_payments: bool,
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct LineRow {
+        description: String,
+        quantity: i64,
+        unit_price_cents: i64,
+        line_total_cents: i64,
+    }
 
     /// The connection pool `main.rs` created at startup.
     ///
@@ -427,18 +623,6 @@ pub mod ssr {
         owner_user_id: &str,
         order: &ValidatedOrder,
     ) -> AppResult<Uuid> {
-        // `validate_create_order` caps this at MAX_ITEMS, but `insert_order` is
-        // callable on its own, so the cast that would otherwise be a silent
-        // truncation is checked here rather than assumed upstream.
-        let positions = (0..order.items.len())
-            .map(|position| {
-                i32::try_from(position).map_err(|_| {
-                    tracing::error!(count = order.items.len(), "order has too many line items");
-                    AppError::Internal
-                })
-            })
-            .collect::<AppResult<Vec<i32>>>()?;
-
         let order_id = Uuid::now_v7();
         let mut transaction = pool.begin().await?;
 
@@ -454,31 +638,60 @@ pub mod ssr {
         .execute(&mut *transaction)
         .await?;
 
-        // One multi-row INSERT rather than a statement per item: the round trips
-        // are what cost, not the rows.
-        if !order.items.is_empty() {
-            let mut builder = QueryBuilder::new(
-                "INSERT INTO order_items \
-                 (id, order_id, position, description, quantity, unit_price_cents, line_total_cents) ",
-            );
-            builder.push_values(
-                positions.into_iter().zip(order.items.iter()),
-                |mut row, (position, item)| {
-                    row.push_bind(Uuid::now_v7())
-                        .push_bind(order_id)
-                        .push_bind(position)
-                        .push_bind(item.description.clone())
-                        .push_bind(item.quantity)
-                        .push_bind(item.unit_price_cents)
-                        .push_bind(item.line_total_cents);
-                },
-            );
-            builder.build().execute(&mut *transaction).await?;
-        }
+        insert_items(&mut transaction, order_id, order).await?;
 
         transaction.commit().await?;
 
         Ok(order_id)
+    }
+
+    /// Writes every line item of an order in one statement.
+    ///
+    /// Shared by the create and update paths so both agree on positions and on
+    /// the stored line totals; takes a connection rather than a pool because it
+    /// is only ever correct inside somebody else's transaction.
+    async fn insert_items(
+        transaction: &mut PgConnection,
+        order_id: Uuid,
+        order: &ValidatedOrder,
+    ) -> AppResult<()> {
+        if order.items.is_empty() {
+            return Ok(());
+        }
+
+        // `validate_create_order` caps this at MAX_ITEMS, but these functions
+        // are callable on their own, so the cast that would otherwise be a
+        // silent truncation is checked here rather than assumed upstream.
+        let positions = (0..order.items.len())
+            .map(|position| {
+                i32::try_from(position).map_err(|_| {
+                    tracing::error!(count = order.items.len(), "order has too many line items");
+                    AppError::Internal
+                })
+            })
+            .collect::<AppResult<Vec<i32>>>()?;
+
+        // One multi-row INSERT rather than a statement per item: the round trips
+        // are what cost, not the rows.
+        let mut builder = QueryBuilder::new(
+            "INSERT INTO order_items \
+             (id, order_id, position, description, quantity, unit_price_cents, line_total_cents) ",
+        );
+        builder.push_values(
+            positions.into_iter().zip(order.items.iter()),
+            |mut row, (position, item)| {
+                row.push_bind(Uuid::now_v7())
+                    .push_bind(order_id)
+                    .push_bind(position)
+                    .push_bind(item.description.clone())
+                    .push_bind(item.quantity)
+                    .push_bind(item.unit_price_cents)
+                    .push_bind(item.line_total_cents);
+            },
+        );
+        builder.build().execute(&mut *transaction).await?;
+
+        Ok(())
     }
 
     /// Validate, then persist. The single entry point both the browser form and
@@ -500,6 +713,280 @@ pub mod ssr {
         );
 
         Ok(order_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Reads
+    //
+    // Every statement below filters on `owner_user_id` in the same `WHERE`
+    // clause that matches the id. That is not a convention to remember — it is
+    // what makes "no such order" and "somebody else's order" indistinguishable
+    // in the result, and therefore indistinguishable in the answer.
+    // -----------------------------------------------------------------------
+
+    /// Every order the caller owns, soonest due first.
+    ///
+    /// One query, not one per order: the item count comes from a `LEFT JOIN`
+    /// and a `GROUP BY` rather than a follow-up read per row.
+    pub async fn list_orders_for_user(
+        pool: &PgPool,
+        owner_user_id: &str,
+    ) -> AppResult<Vec<OrderSummary>> {
+        let rows: Vec<SummaryRow> = sqlx::query_as(
+            "SELECT orders.id, \
+                    orders.customer, \
+                    orders.due_date, \
+                    orders.total_cents, \
+                    0::BIGINT AS paid_cents, \
+                    count(order_items.id) AS item_count \
+             FROM orders \
+             LEFT JOIN order_items ON order_items.order_id = orders.id \
+             WHERE orders.owner_user_id = $1 \
+             GROUP BY orders.id \
+             ORDER BY orders.due_date ASC, orders.created_at ASC",
+        )
+        .bind(owner_user_id)
+        .fetch_all(pool)
+        .await?;
+
+        // One `today` for the whole list, so two rows in the same table cannot
+        // be judged against different days.
+        let today = today();
+
+        Ok(rows
+            .into_iter()
+            .map(|row| OrderSummary {
+                status: derive_order_status(row.total_cents, row.paid_cents, row.due_date, today),
+                id: row.id,
+                customer: row.customer,
+                due_date: row.due_date,
+                total_cents: row.total_cents,
+                paid_cents: row.paid_cents,
+                item_count: row.item_count,
+            })
+            .collect())
+    }
+
+    /// One order with its line items, or [`AppError::NotFound`].
+    ///
+    /// Two statements rather than a join: a join between an order and its items
+    /// returns the order's columns once per item, and reassembling that is more
+    /// code than the round trip saves for a single order.
+    pub async fn find_order_for_user(
+        pool: &PgPool,
+        owner_user_id: &str,
+        order_id: Uuid,
+    ) -> AppResult<OrderDetail> {
+        let order: OrderRow = sqlx::query_as(
+            "SELECT id, \
+                    customer, \
+                    due_date, \
+                    total_cents, \
+                    0::BIGINT AS paid_cents, \
+                    FALSE AS has_payments \
+             FROM orders \
+             WHERE id = $1 AND owner_user_id = $2",
+        )
+        .bind(order_id)
+        .bind(owner_user_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+        let items: Vec<LineRow> = sqlx::query_as(
+            "SELECT description, quantity, unit_price_cents, line_total_cents \
+             FROM order_items \
+             WHERE order_id = $1 \
+             ORDER BY position ASC",
+        )
+        .bind(order_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(OrderDetail {
+            status: derive_order_status(
+                order.total_cents,
+                order.paid_cents,
+                order.due_date,
+                today(),
+            ),
+            editable: !order.has_payments,
+            id: order.id,
+            customer: order.customer,
+            due_date: order.due_date,
+            total_cents: order.total_cents,
+            paid_cents: order.paid_cents,
+            items: items
+                .into_iter()
+                .map(|row| OrderLine {
+                    description: row.description,
+                    quantity: row.quantity,
+                    unit_price_cents: row.unit_price_cents,
+                    line_total_cents: row.line_total_cents,
+                })
+                .collect(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Writes
+    // -----------------------------------------------------------------------
+
+    /// Locks the caller's order for the rest of the transaction.
+    ///
+    /// `FOR UPDATE` on the order row is the serialization point for everything
+    /// that touches the order, including Feature 6's payment insert. Ownership
+    /// is part of the same `WHERE`, so a row that is not the caller's is never
+    /// locked and never found.
+    ///
+    /// Postgres refuses `FOR UPDATE` alongside an aggregate, which is why the
+    /// lock is taken on the order row itself and the payment check below is a
+    /// separate statement.
+    async fn lock_owned_order(
+        transaction: &mut PgConnection,
+        owner_user_id: &str,
+        order_id: Uuid,
+    ) -> AppResult<()> {
+        sqlx::query("SELECT id FROM orders WHERE id = $1 AND owner_user_id = $2 FOR UPDATE")
+            .bind(order_id)
+            .bind(owner_user_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(AppError::NotFound)?;
+
+        Ok(())
+    }
+
+    /// Refuses to change an order that money has been recorded against.
+    ///
+    /// **Feature 6 replaces the body** with a query against the payments table.
+    /// It is called here, inside the transaction and after the lock, because
+    /// that is the only position where the answer stays true until the commit —
+    /// adding it later would mean restructuring both write paths rather than
+    /// filling in one query.
+    ///
+    /// That guarantee is a contract with Feature 6, not a property of this
+    /// function: a payment insert that does not first call
+    /// [`lock_owned_order`] on the same order row can still commit between this
+    /// check and the commit below.
+    async fn ensure_no_payments(transaction: &mut PgConnection, order_id: Uuid) -> AppResult<()> {
+        // Selected from `orders` rather than as a bare literal so the statement
+        // is already the shape Feature 6 needs, and so it reads the row this
+        // transaction just locked.
+        let has_payments: bool = sqlx::query_scalar("SELECT FALSE FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+
+        if has_payments {
+            tracing::info!(%order_id, "refused to change an order that has payments");
+            return Err(AppError::OrderHasPayments);
+        }
+
+        Ok(())
+    }
+
+    /// Replaces an order's contents in one transaction.
+    ///
+    /// The line items are deleted and reinserted rather than diffed. A line item
+    /// has no identity a user ever refers to — it is a row in a list they
+    /// retyped — and matching old rows to new ones by position would invent an
+    /// identity that the edit did not preserve.
+    pub async fn update_order_transaction(
+        pool: &PgPool,
+        owner_user_id: &str,
+        order_id: Uuid,
+        order: &ValidatedOrder,
+    ) -> AppResult<()> {
+        let mut transaction = pool.begin().await?;
+
+        lock_owned_order(&mut transaction, owner_user_id, order_id).await?;
+        ensure_no_payments(&mut transaction, order_id).await?;
+
+        sqlx::query(
+            "UPDATE orders \
+             SET customer = $1, due_date = $2, total_cents = $3, updated_at = now() \
+             WHERE id = $4",
+        )
+        .bind(&order.customer)
+        .bind(order.due_date)
+        .bind(order.total_cents)
+        .bind(order_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query("DELETE FROM order_items WHERE order_id = $1")
+            .bind(order_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        insert_items(&mut transaction, order_id, order).await?;
+
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    /// Deletes an order. Its line items go with it through `ON DELETE CASCADE`.
+    pub async fn delete_order_transaction(
+        pool: &PgPool,
+        owner_user_id: &str,
+        order_id: Uuid,
+    ) -> AppResult<()> {
+        let mut transaction = pool.begin().await?;
+
+        lock_owned_order(&mut transaction, owner_user_id, order_id).await?;
+        ensure_no_payments(&mut transaction, order_id).await?;
+
+        sqlx::query("DELETE FROM orders WHERE id = $1")
+            .bind(order_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Services
+    //
+    // Validate, then persist. The single entry point for each operation, so the
+    // browser and Feature 9's REST surface cannot acquire different ideas of
+    // what an order is.
+    // -----------------------------------------------------------------------
+
+    pub async fn update_order_service(
+        pool: &PgPool,
+        owner_user_id: &str,
+        order_id: Uuid,
+        input: &NewOrderInput,
+    ) -> AppResult<()> {
+        // The submitted values are revalidated and the total recomputed from
+        // scratch. An edit is a new order that happens to keep an id.
+        let order = validate_create_order(input)?;
+        update_order_transaction(pool, owner_user_id, order_id, &order).await?;
+
+        tracing::info!(
+            %order_id,
+            items = order.items.len(),
+            total_cents = order.total_cents,
+            "order updated"
+        );
+
+        Ok(())
+    }
+
+    pub async fn delete_order_service(
+        pool: &PgPool,
+        owner_user_id: &str,
+        order_id: Uuid,
+    ) -> AppResult<()> {
+        delete_order_transaction(pool, owner_user_id, order_id).await?;
+
+        tracing::info!(%order_id, "order deleted");
+
+        Ok(())
     }
 }
 
@@ -535,9 +1022,104 @@ pub async fn create_order(input: NewOrderInput) -> Result<Uuid, AppError> {
     )
 }
 
+/// Replaces an order the caller owns.
+///
+/// Ownership is not checked here. It is part of the `WHERE` clause of the
+/// locking statement inside the transaction, which is the only place where the
+/// answer is still true by the time the write lands.
+#[server(input = Json)]
+pub async fn update_order(id: Uuid, input: NewOrderInput) -> Result<(), AppError> {
+    use crate::auth::ssr::{ensure_same_origin, incoming_parts, require_user};
+    use crate::error::ssr::report;
+    use ssr::{pool, update_order_service};
+
+    report(
+        async move {
+            let parts = incoming_parts()?;
+            ensure_same_origin(&parts)?;
+
+            let user = require_user().await?;
+
+            update_order_service(&pool()?, &user.id, id, &input).await
+        }
+        .await,
+    )
+}
+
+/// Deletes an order the caller owns.
+#[server]
+pub async fn delete_order(id: Uuid) -> Result<(), AppError> {
+    use crate::auth::ssr::{ensure_same_origin, incoming_parts, require_user};
+    use crate::error::ssr::report;
+    use ssr::{delete_order_service, pool};
+
+    report(
+        async move {
+            let parts = incoming_parts()?;
+            ensure_same_origin(&parts)?;
+
+            let user = require_user().await?;
+
+            delete_order_service(&pool()?, &user.id, id).await
+        }
+        .await,
+    )
+}
+
+/// Every order the caller owns.
+///
+/// A read, so there is no same-origin check: a `GET`-shaped request that leaks
+/// nothing to a third party — the response is only readable by the origin that
+/// made it — and `require_user` is what decides whose orders these are.
+#[server]
+pub async fn list_orders() -> Result<Vec<OrderSummary>, AppError> {
+    use crate::auth::ssr::require_user;
+    use crate::error::ssr::report;
+    use ssr::{list_orders_for_user, pool};
+
+    report(
+        async move {
+            let user = require_user().await?;
+
+            list_orders_for_user(&pool()?, &user.id).await
+        }
+        .await,
+    )
+}
+
+/// One order the caller owns, with its line items.
+#[server]
+pub async fn get_order(id: Uuid) -> Result<OrderDetail, AppError> {
+    use crate::auth::ssr::require_user;
+    use crate::error::ssr::report;
+    use ssr::{find_order_for_user, pool};
+
+    report(
+        async move {
+            let user = require_user().await?;
+
+            find_order_for_user(&pool()?, &user.id, id).await
+        }
+        .await,
+    )
+}
+
 // ---------------------------------------------------------------------------
-// Creation form
+// The editor
 // ---------------------------------------------------------------------------
+
+/// Renders an amount as the plain decimal string the money input accepts.
+///
+/// Deliberately not [`crate::app::format_cents`]: that one adds a currency
+/// symbol and thousands separators for reading. This one produces a value that
+/// [`parse_money_to_cents`] turns back into exactly the same integer, which is
+/// what an input prefilled from an existing order needs.
+pub fn format_cents_for_input(cents: i64) -> String {
+    let magnitude = cents.unsigned_abs();
+    let sign = if cents < 0 { "-" } else { "" };
+
+    format!("{sign}{}.{:02}", magnitude / 100, magnitude % 100)
+}
 
 /// One editable row. Every field is its own signal so typing in one cell does
 /// not re-render the others, and the row is `Copy` so `<For>` can hand it out
@@ -564,6 +1146,16 @@ impl ItemRow {
         }
     }
 
+    /// A row prefilled from a stored line item.
+    fn from_line(key: usize, line: &OrderLine) -> Self {
+        Self {
+            key,
+            description: RwSignal::new(line.description.clone()),
+            quantity: RwSignal::new(line.quantity.to_string()),
+            unit_price: RwSignal::new(format_cents_for_input(line.unit_price_cents)),
+        }
+    }
+
     fn to_input(self) -> OrderItemInput {
         OrderItemInput {
             description: self.description.get_untracked(),
@@ -573,27 +1165,75 @@ impl ItemRow {
     }
 }
 
-/// The new-order form: customer, due date, and a variable number of line items.
+/// The order form, for a new order or an existing one.
+///
+/// One component for both because they are the same form: the fields, the
+/// validation, the arithmetic, and the server's answer are identical, and the
+/// only difference is which server function the submit dispatches to and where
+/// it goes afterwards. Two components would be two places to fix a form bug.
 ///
 /// The running total is computed in the browser from the same parsers the
 /// server uses, so it is a preview of the server's answer rather than a second
-/// opinion. It is never submitted: [`create_order`] recomputes everything from
-/// the raw strings.
+/// opinion. It is never submitted: the server recomputes everything from the
+/// raw strings.
 #[component]
-pub fn OrderEditor() -> impl IntoView {
+pub fn OrderEditor(
+    /// The order being edited, or `None` to create one.
+    #[prop(optional)]
+    existing: Option<OrderDetail>,
+) -> impl IntoView {
     let create = ServerAction::<CreateOrder>::new();
+    let update = ServerAction::<UpdateOrder>::new();
     let navigate = use_navigate();
 
-    let customer = RwSignal::new(String::new());
-    let due_date = RwSignal::new(String::new());
-    let rows = RwSignal::new(vec![ItemRow::new(0)]);
-    let next_key = RwSignal::new(1_usize);
+    let editing = existing.as_ref().map(|order| order.id);
+    let customer = RwSignal::new(
+        existing
+            .as_ref()
+            .map(|order| order.customer.clone())
+            .unwrap_or_default(),
+    );
+    let due_date = RwSignal::new(
+        existing
+            .as_ref()
+            // The value an `<input type="date">` accepts, which is the same
+            // format `parse_due_date` reads back. `Display` for `NaiveDate` is
+            // already ISO 8601; `format()` would say so explicitly but is not
+            // compiled into the browser build, where chrono has no `alloc`.
+            .map(|order| order.due_date.to_string())
+            .unwrap_or_default(),
+    );
+    let initial_rows: Vec<ItemRow> = match &existing {
+        Some(order) => order
+            .items
+            .iter()
+            .enumerate()
+            .map(|(key, line)| ItemRow::from_line(key, line))
+            .collect(),
+        None => Vec::new(),
+    };
+    // An order always has at least one row to type into, including a stored one
+    // whose items somehow went missing.
+    let next_key = RwSignal::new(initial_rows.len().max(1));
+    let rows = RwSignal::new(if initial_rows.is_empty() {
+        vec![ItemRow::new(0)]
+    } else {
+        initial_rows
+    });
     // Set by any keystroke in the form, cleared on submit. See `failure`.
     let edited = RwSignal::new(false);
 
     // Effects do not run during SSR, so this is browser-only by construction.
+    // Both land on the order's own page: after creating it, that page is the
+    // proof it exists; after editing, it is where the change is visible.
+    let after_create = navigate.clone();
     Effect::new(move |_| {
         if let Some(Ok(order_id)) = create.value().get() {
+            after_create(&format!("/orders/{order_id}"), Default::default());
+        }
+    });
+    Effect::new(move |_| {
+        if let (Some(Ok(())), Some(order_id)) = (update.value().get(), editing) {
             navigate(&format!("/orders/{order_id}"), Default::default());
         }
     });
@@ -603,10 +1243,19 @@ pub fn OrderEditor() -> impl IntoView {
     // anything, those values no longer exist — leaving "Enter the customer's
     // name." under a field that now has a name in it is worse than showing
     // nothing, so the whole verdict is withdrawn on the first keystroke.
-    let failure = Signal::derive(move || match create.value().get() {
-        Some(Err(error)) if !edited.get() => Some(error),
-        _ => None,
+    let failure = Signal::derive(move || {
+        if edited.get() {
+            return None;
+        }
+
+        // Only one of the two is ever dispatched by a given mount.
+        match (create.value().get(), update.value().get()) {
+            (Some(Err(error)), _) | (_, Some(Err(error))) => Some(error),
+            _ => None,
+        }
     });
+
+    let pending = Signal::derive(move || create.pending().get() || update.pending().get());
 
     // Takes an owned name because the row fields are built with `format!`.
     let message_for = move |field: String| -> Option<String> {
@@ -650,17 +1299,24 @@ pub fn OrderEditor() -> impl IntoView {
         event.prevent_default();
         edited.set(false);
 
-        create.dispatch(CreateOrder {
-            input: NewOrderInput {
-                customer: customer.get_untracked(),
-                due_date: due_date.get_untracked(),
-                items: rows
-                    .get_untracked()
-                    .into_iter()
-                    .map(ItemRow::to_input)
-                    .collect(),
-            },
-        });
+        let input = NewOrderInput {
+            customer: customer.get_untracked(),
+            due_date: due_date.get_untracked(),
+            items: rows
+                .get_untracked()
+                .into_iter()
+                .map(ItemRow::to_input)
+                .collect(),
+        };
+
+        match editing {
+            Some(id) => {
+                update.dispatch(UpdateOrder { id, input });
+            }
+            None => {
+                create.dispatch(CreateOrder { input });
+            }
+        }
     };
 
     view! {
@@ -694,6 +1350,15 @@ pub fn OrderEditor() -> impl IntoView {
                         aria-invalid=move || {
                             message_for("customer".to_string()).map(|_| "true")
                         }
+                        // Both, and neither is redundant. `value` is the HTML
+                        // attribute, and it is the only one of the two that
+                        // server-side rendering emits — without it the edit form
+                        // arrives blank and stays blank, because hydration
+                        // assumes the DOM already matches. `prop:value` is the
+                        // live DOM property, which is what an already-rendered
+                        // input actually displays once the user has typed into
+                        // it.
+                        value=move || customer.get()
                         prop:value=move || customer.get()
                         on:input:target=move |event| customer.set(event.target().value())
                     />
@@ -708,6 +1373,7 @@ pub fn OrderEditor() -> impl IntoView {
                         aria-invalid=move || {
                             message_for("due_date".to_string()).map(|_| "true")
                         }
+                        value=move || due_date.get()
                         prop:value=move || due_date.get()
                         on:input:target=move |event| due_date.set(event.target().value())
                     />
@@ -737,6 +1403,7 @@ pub fn OrderEditor() -> impl IntoView {
                                     aria-label=move || {
                                         format!("Item {} description", position_of(row.key) + 1)
                                     }
+                                    value=move || row.description.get()
                                     prop:value=move || row.description.get()
                                     on:input:target=move |event| {
                                         row.description.set(event.target().value())
@@ -755,6 +1422,7 @@ pub fn OrderEditor() -> impl IntoView {
                                     aria-label=move || {
                                         format!("Item {} quantity", position_of(row.key) + 1)
                                     }
+                                    value=move || row.quantity.get()
                                     prop:value=move || row.quantity.get()
                                     on:input:target=move |event| {
                                         row.quantity.set(event.target().value())
@@ -774,6 +1442,7 @@ pub fn OrderEditor() -> impl IntoView {
                                     aria-label=move || {
                                         format!("Item {} unit price", position_of(row.key) + 1)
                                     }
+                                    value=move || row.unit_price.get()
                                     prop:value=move || row.unit_price.get()
                                     on:input:target=move |event| {
                                         row.unit_price.set(event.target().value())
@@ -826,11 +1495,363 @@ pub fn OrderEditor() -> impl IntoView {
                 }}
             </p>
 
-            <button type="submit" aria-busy=move || create.pending().get().to_string()>
-                {move || if create.pending().get() { "Saving…" } else { "Create order" }}
-            </button>
+            <div class="form-actions">
+                <button type="submit" aria-busy=move || pending.get().to_string()>
+                    {move || match (pending.get(), editing.is_some()) {
+                        (true, _) => "Saving…",
+                        (false, true) => "Save changes",
+                        (false, false) => "Create order",
+                    }}
+                </button>
+                {editing
+                    .map(|order_id| {
+                        view! {
+                            <A href=format!("/orders/{order_id}") attr:class="secondary outline">
+                                "Cancel"
+                            </A>
+                        }
+                    })}
+            </div>
         </form>
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+/// Renders a resource's error the same way on every page.
+///
+/// A failed read is not a broken page: the shell, the navigation, and the retry
+/// route all still work, so the failure is reported in place rather than thrown
+/// to the `ErrorBoundary` in `src/app.rs`.
+#[component]
+fn LoadFailure(error: AppError) -> impl IntoView {
+    view! {
+        <article class="error-panel" role="alert">
+            {error.to_string()}
+        </article>
+    }
+}
+
+/// The order list: everything the signed-in user owns, soonest due first.
+#[component]
+pub fn OrdersPage() -> impl IntoView {
+    let orders = Resource::new(|| (), |()| list_orders());
+
+    view! {
+        <Title text="Orders - Orders and Settlements" />
+        <h1>"Orders"</h1>
+
+        <Transition fallback=|| view! { <p aria-busy="true">"Loading orders…"</p> }>
+            {move || Suspend::new(async move {
+                match orders.await {
+                    Err(error) => view! { <LoadFailure error /> }.into_any(),
+                    Ok(orders) if orders.is_empty() => {
+                        view! {
+                            <article class="empty-state">
+                                <p>"No orders yet."</p>
+                                <A href="/orders/new">"Create the first one"</A>
+                            </article>
+                        }
+                            .into_any()
+                    }
+                    Ok(orders) => {
+                        view! {
+                            <table class="order-table">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">"Customer"</th>
+                                        <th scope="col">"Due"</th>
+                                        <th scope="col">"Status"</th>
+                                        <th scope="col">"Items"</th>
+                                        <th scope="col">"Total"</th>
+                                        <th scope="col">"Due now"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {orders
+                                        .into_iter()
+                                        .map(|order| {
+                                            let href = format!("/orders/{}", order.id);
+                                            let due = order.due_date.to_string();
+                                            let amount_due = order.amount_due_cents();
+                                            view! {
+                                                <tr>
+                                                    <td>
+                                                        // The customer name is the link, so the
+                                                        // target is named rather than being a bare
+                                                        // "view" a screen reader reads out of
+                                                        // context.
+                                                        <A href=href>{order.customer}</A>
+                                                    </td>
+                                                    <td>{due}</td>
+                                                    <td>
+                                                        <StatusBadge status=order.status.as_str() />
+                                                    </td>
+                                                    <td>{order.item_count}</td>
+                                                    <td>
+                                                        <MoneyText cents=order.total_cents />
+                                                    </td>
+                                                    <td>
+                                                        <MoneyText cents=amount_due />
+                                                    </td>
+                                                </tr>
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()}
+                                </tbody>
+                            </table>
+                        }
+                            .into_any()
+                    }
+                }
+            })}
+        </Transition>
+    }
+}
+
+/// One order, its line items, and the actions available on it.
+#[component]
+pub fn OrderDetailPage() -> impl IntoView {
+    let order_id = use_order_id();
+    let delete = ServerAction::<DeleteOrder>::new();
+    let order = Resource::new(
+        move || order_id.get(),
+        |order_id| async move {
+            match order_id {
+                Some(order_id) => get_order(order_id).await,
+                None => Err(AppError::NotFound),
+            }
+        },
+    );
+
+    // A completed delete leaves this route pointing at a row that no longer
+    // exists, so staying here would show the caller "that order does not
+    // exist" about the order they just deleted. Only success navigates; a
+    // refusal leaves the page as it is, with the reason rendered below.
+    //
+    // `replace`, so the browser's Back button does not return to the dead
+    // detail page.
+    let navigate = use_navigate();
+    Effect::new(move |_| {
+        if let Some(Ok(())) = delete.value().get() {
+            navigate(
+                "/orders",
+                NavigateOptions {
+                    replace: true,
+                    ..Default::default()
+                },
+            );
+        }
+    });
+
+    view! {
+        <Title text="Order - Orders and Settlements" />
+
+        <Transition fallback=|| view! { <p aria-busy="true">"Loading order…"</p> }>
+            {move || Suspend::new(async move {
+                match order.await {
+                    Err(error) => view! { <LoadFailure error /> }.into_any(),
+                    Ok(order) => view! { <OrderDetailView order delete /> }.into_any(),
+                }
+            })}
+        </Transition>
+    }
+}
+
+/// The loaded order. Split out so the page above holds only the loading and
+/// failure paths, and this holds only the rendering.
+#[component]
+fn OrderDetailView(order: OrderDetail, delete: ServerAction<DeleteOrder>) -> impl IntoView {
+    let confirming = RwSignal::new(false);
+    let order_id = order.id;
+    let editable = order.editable;
+
+    view! {
+        <hgroup>
+            <h1>{order.customer.clone()}</h1>
+            <p>"Due " {order.due_date.to_string()}</p>
+        </hgroup>
+
+        <p>
+            <StatusBadge status=order.status.as_str() />
+        </p>
+
+        <table class="order-table">
+            <thead>
+                <tr>
+                    <th scope="col">"Description"</th>
+                    <th scope="col">"Quantity"</th>
+                    <th scope="col">"Unit price"</th>
+                    <th scope="col">"Line total"</th>
+                </tr>
+            </thead>
+            <tbody>
+                {order
+                    .items
+                    .iter()
+                    .map(|line| {
+                        view! {
+                            <tr>
+                                <td>{line.description.clone()}</td>
+                                <td>{line.quantity}</td>
+                                <td>
+                                    <MoneyText cents=line.unit_price_cents />
+                                </td>
+                                <td>
+                                    <MoneyText cents=line.line_total_cents />
+                                </td>
+                            </tr>
+                        }
+                    })
+                    .collect::<Vec<_>>()}
+            </tbody>
+        </table>
+
+        <dl class="totals">
+            <dt>"Order total"</dt>
+            <dd>
+                <MoneyText cents=order.total_cents />
+            </dd>
+            <dt>"Paid"</dt>
+            <dd>
+                <MoneyText cents=order.paid_cents />
+            </dd>
+            <dt>"Amount due"</dt>
+            <dd>
+                <MoneyText cents=order.amount_due_cents() />
+            </dd>
+        </dl>
+
+        {move || {
+            (!editable)
+                .then(|| {
+                    view! {
+                        <p class="notice">
+                            "This order has payments recorded against it and can no longer be changed."
+                        </p>
+                    }
+                })
+        }}
+
+        {move || {
+            editable
+                .then(|| {
+                    view! {
+                        <div class="form-actions">
+                            // `role="button"` so it sits beside Delete as an
+                            // equal action rather than as body-text link. It is
+                            // still an <a>: it navigates, and middle-click and
+                            // "open in new tab" keep working.
+                            <A
+                                href=format!("/orders/{order_id}/edit")
+                                attr:class="secondary"
+                                attr:role="button"
+                            >
+                                "Edit"
+                            </A>
+
+                            // Two steps, because a delete cannot be undone and
+                            // the cascade takes the line items with it. The
+                            // confirmation only exists once the page has
+                            // hydrated; the delete itself is a server function
+                            // that re-checks ownership and payments, so the
+                            // extra click is a courtesy, not the safeguard.
+                            <Show
+                                when=move || confirming.get()
+                                fallback=move || {
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class="danger outline"
+                                            on:click=move |_| confirming.set(true)
+                                        >
+                                            "Delete"
+                                        </button>
+                                    }
+                                }
+                            >
+                                <button
+                                    type="button"
+                                    class="danger"
+                                    aria-busy=move || delete.pending().get().to_string()
+                                    on:click=move |_| {
+                                        delete.dispatch(DeleteOrder { id: order_id });
+                                    }
+                                >
+                                    "Delete permanently"
+                                </button>
+                                <button
+                                    type="button"
+                                    class="secondary outline"
+                                    on:click=move |_| confirming.set(false)
+                                >
+                                    "Keep it"
+                                </button>
+                            </Show>
+                        </div>
+                    }
+                })
+        }}
+
+        {move || {
+            match delete.value().get() {
+                Some(Err(error)) => Some(view! { <LoadFailure error /> }),
+                _ => None,
+            }
+        }}
+    }
+}
+
+/// The edit page: loads the order, then hands it to [`OrderEditor`].
+#[component]
+pub fn EditOrderPage() -> impl IntoView {
+    let order_id = use_order_id();
+    let order = Resource::new(
+        move || order_id.get(),
+        |order_id| async move {
+            match order_id {
+                Some(order_id) => get_order(order_id).await,
+                None => Err(AppError::NotFound),
+            }
+        },
+    );
+
+    view! {
+        <Title text="Edit order - Orders and Settlements" />
+        <h1>"Edit order"</h1>
+
+        <Transition fallback=|| view! { <p aria-busy="true">"Loading order…"</p> }>
+            {move || Suspend::new(async move {
+                match order.await {
+                    Err(error) => view! { <LoadFailure error /> }.into_any(),
+                    // The server refuses the update as well; this only avoids
+                    // presenting a form that cannot be submitted.
+                    Ok(order) if !order.editable => {
+                        view! { <LoadFailure error=AppError::OrderHasPayments /> }.into_any()
+                    }
+                    Ok(order) => view! { <OrderEditor existing=order /> }.into_any(),
+                }
+            })}
+        </Transition>
+    }
+}
+
+/// The `:id` segment of the current route, parsed.
+///
+/// `None` for a segment that is not a UUID, which the pages above turn into the
+/// same not-found answer the server gives for an id that does not exist. A
+/// typo in the address bar is not a different kind of failure.
+fn use_order_id() -> Memo<Option<Uuid>> {
+    let params = use_params_map();
+
+    Memo::new(move |_| {
+        params
+            .read()
+            .get("id")
+            .and_then(|raw| Uuid::parse_str(&raw).ok())
+    })
 }
 
 #[cfg(test)]

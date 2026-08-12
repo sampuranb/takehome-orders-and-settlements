@@ -35,6 +35,13 @@
   --oas-tone-bad-background: #f8d7da;
   --oas-tone-neutral-text: #41464b;
   --oas-tone-neutral-background: #e2e3e5;
+
+  /* A filled destructive button. Separate from the tone pair above, which is
+   * text-on-tint: reusing --oas-tone-bad-text as a *background* puts white text
+   * on a pale pink in dark mode and cannot be read. This pair is fixed across
+   * both schemes because a solid red reads as destructive in either. */
+  --oas-danger-background: #b02a37;
+  --oas-danger-text: #ffffff;
 }
 
 /* The document sets only <meta name="color-scheme">, so the browser preference
@@ -130,6 +137,93 @@ nav a[aria-current="page"] {
   display: block;
   margin-top: 0.25rem;
   color: var(--pico-form-element-invalid-border-color);
+}
+
+/* Order list. Amount columns are right-aligned so the digits of two totals sit
+ * above one another; the customer column keeps the remaining width. */
+.order-table th:nth-child(n + 4),
+.order-table td:nth-child(n + 4) {
+  text-align: right;
+}
+
+.order-table td:first-child {
+  width: 100%;
+}
+
+/* The customer column takes the slack, so every other column is as narrow as
+ * the browser can make it — narrow enough to break an ISO date over three
+ * lines without this. */
+.order-table th:not(:first-child),
+.order-table td:not(:first-child) {
+  white-space: nowrap;
+}
+
+/* Shown in place of a table with no rows. Pico's <article> already supplies the
+ * card; this only centres the invitation inside it. */
+.empty-state {
+  text-align: center;
+}
+
+/* The detail page's total block: a <dl> of label/amount pairs rather than a
+ * second table, laid out as two columns so each amount sits against its term. */
+.totals {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 1rem;
+  margin-block: 1rem;
+  max-width: 24rem;
+}
+
+.totals > dt {
+  font-weight: 600;
+}
+
+.totals > dd {
+  margin: 0;
+  text-align: right;
+}
+
+/* A statement about the record, not a failure: "this order has payments and can
+ * no longer be edited". Distinct from .error-panel, which reports an error. */
+.notice {
+  border-left: 4px solid var(--pico-primary);
+  padding: 0.75rem 1rem;
+  margin-block: 1rem;
+  background-color: var(--pico-card-sectioning-background-color);
+}
+
+/* Buttons on one row at their natural width, instead of Pico's full-width
+ * default, so "Delete" is not the same size as "Save". */
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-block: 1rem;
+}
+
+.form-actions > button,
+.form-actions > a[role="button"] {
+  width: auto;
+  margin-bottom: 0;
+}
+
+/* Destructive actions. Pico has no danger variant, so the tone tokens defined
+ * at the top of this file are reused rather than a fourth red being introduced. */
+button.danger,
+a[role="button"].danger {
+  --pico-background-color: var(--oas-danger-background);
+  --pico-border-color: var(--oas-danger-background);
+  --pico-color: var(--oas-danger-text);
+}
+
+/* The first click of the two-step delete. Outlined, because it is the step that
+ * only asks; the filled button above is the one that acts. */
+button.danger.outline,
+a[role="button"].danger.outline {
+  --pico-background-color: transparent;
+  --pico-border-color: var(--oas-tone-bad-text);
+  --pico-color: var(--oas-tone-bad-text);
 }
 
 /* Rendered by the layout's error boundary. */

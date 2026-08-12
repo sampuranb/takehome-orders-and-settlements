@@ -5,9 +5,7 @@
 //! (JSON), and SSR HTML. It therefore carries no `sqlx`, `axum`, or `reqwest`
 //! types — only owned data that serde can move across the wire.
 //!
-//! Later features extend this enum: field validation and overflow in Feature 4,
-//! not-found and immutable-order conflicts in Feature 5, and actionable
-//! overpayment detail in Feature 6.
+//! Feature 6 extends this enum once more, with actionable overpayment detail.
 
 use leptos::server_fn::{
     codec::JsonEncoding,
@@ -75,6 +73,26 @@ pub enum AppError {
     #[error("That amount is too large. Keep the order total below $92,233,720,368,547,758.")]
     AmountOutOfRange,
 
+    /// The requested record does not exist, or it belongs to somebody else.
+    ///
+    /// One variant for both on purpose. Every read is scoped by owner in the
+    /// same `WHERE` clause that matches the id, so the two cases are not
+    /// distinguishable in the query result — and they must not be
+    /// distinguishable in the answer either. A separate `403` would confirm to a
+    /// stranger that a given order id exists.
+    #[error("That order does not exist, or it is not yours.")]
+    NotFound,
+
+    /// The order has money recorded against it and can no longer be changed.
+    ///
+    /// Becomes reachable in Feature 6, which creates the payments table. The
+    /// variant, its status, and the guard that raises it are written here
+    /// because that is where the edit and delete transactions live: the check
+    /// belongs inside those transactions, after the row lock, and adding it
+    /// later would mean restructuring them rather than changing one query.
+    #[error("This order has payments recorded against it and can no longer be changed.")]
+    OrderHasPayments,
+
     /// The server function framework failed before or after our code ran —
     /// a network drop mid-submit, or a response it could not decode. Carries
     /// the framework's own description because there is nothing server-side to
@@ -94,6 +112,8 @@ impl AppError {
             Self::AuthRejected(_) => "AUTH_REJECTED",
             Self::ValidationFailed(_) => "VALIDATION_FAILED",
             Self::AmountOutOfRange => "AMOUNT_OUT_OF_RANGE",
+            Self::NotFound => "NOT_FOUND",
+            Self::OrderHasPayments => "ORDER_HAS_PAYMENTS",
             Self::Transport(_) => "TRANSPORT",
         }
     }
@@ -123,6 +143,10 @@ impl AppError {
             Self::Unauthenticated => 401,
             Self::ForbiddenOrigin => 403,
             Self::AuthRejected(_) | Self::ValidationFailed(_) | Self::AmountOutOfRange => 400,
+            Self::NotFound => 404,
+            // Not a `400`: the request is well formed and the caller is
+            // entitled to make it. The order's own state is what refuses.
+            Self::OrderHasPayments => 409,
         }
     }
 }

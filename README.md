@@ -4,9 +4,9 @@ Full-stack Rust application for creating orders with line items, recording full
 or partial payments against them, and viewing a dashboard of derived status and
 amounts due.
 
-> **Status: in progress.** The foundation and authentication are complete and
-> verified. Orders, payments, the dashboard, and the REST API are not
-> implemented yet. See [Current status](#current-status).
+> **Status: in progress.** The foundation, authentication, and the full order
+> lifecycle are complete and verified. Payments, the dashboard, and the REST API
+> are not implemented yet. See [Current status](#current-status).
 
 ## Stack
 
@@ -99,12 +99,15 @@ cannot serve.
 | `POST` | `/api/sign_out*` | Server function: revoke the session |
 | `POST` | `/api/current_user*` | Server function: resolve the caller's identity |
 | `POST` | `/api/create_order*` | Server function: validate and persist an order (JSON body) |
+| `POST` | `/api/update_order*` | Server function: revalidate and replace an order (JSON body) |
+| `POST` | `/api/delete_order*` | Server function: delete an order and its line items |
+| `POST` | `/api/list_orders*` | Server function: the caller's orders with derived status |
+| `POST` | `/api/get_order*` | Server function: one order with its line items |
 | `GET` | `/pkg/*` | Hydration bundle and stylesheet |
 
 Application pages are server-rendered and then hydrated. Unmatched paths return
 `404` with the same shell. `/auth` is the only public page; everything else is
-gated. The order list and detail pages are placeholders until their features
-land; the REST API for orders and payments arrives with those features.
+gated. The REST API for orders and payments arrives with a later feature.
 
 Server-function paths carry a generated suffix, so the exact URLs are read from
 the rendered `<form action>` rather than hard-coded.
@@ -165,6 +168,33 @@ transaction: the stored `total_cents` describes rows in another table, which no
 `CHECK` constraint can see, so the transaction is the only thing holding that
 invariant.
 
+## Status
+
+An order's status is never stored. It is derived on every read from three
+things: the order total, how much has been paid against it, and today's date.
+
+| Condition | Status |
+| --- | --- |
+| Paid at least the total | Paid |
+| Otherwise, past its due date | Overdue |
+| Otherwise, some payment recorded | Partially paid |
+| Otherwise | Pending |
+
+The order of those tests is the specification, not an implementation detail.
+Paid outranks overdue, so an invoice settled late is finished rather than
+outstanding; overdue outranks partially paid, so money still owed past the date
+is not softened by a part payment.
+
+Storing the status would create a second source of truth that goes stale on its
+own: an order becomes overdue because a day passed, with nothing writing to the
+database at all. There is no event to hang an update on, so there is nothing to
+store.
+
+"Today" is UTC. A due date is a calendar date with no time zone attached, and
+this application stores no time zone for a user to be correct relative to.
+`derive_order_status` takes today as a parameter rather than reading a clock, so
+every branch is reachable from a test without waiting for a date to arrive.
+
 ## Third-party assets
 
 `style/main.css` begins with [Pico CSS](https://picocss.com) v2.1.1, vendored
@@ -202,10 +232,16 @@ cookie re-emission on this origin, revoked and forged sessions, the same-origin
 gate, hydrated navigation without a full page load, a multi-row order editor
 with a live total, and the stored cent values read back out of Postgres.
 
-`create_order` was additionally exercised with `curl`, which is the only way to
-see the status line rather than the decoded body: `403 FORBIDDEN_ORIGIN` with a
-missing or foreign `Origin`, `401 UNAUTHENTICATED` with no session, and
-`400 VALIDATION_FAILED` carrying every field message for a bad submission.
+The order functions were additionally exercised with `curl`, which is the only
+way to see the status line rather than the decoded body: `403 FORBIDDEN_ORIGIN`
+with a missing or foreign `Origin`, `401 UNAUTHENTICATED` with no session,
+`400 VALIDATION_FAILED` carrying every field message for a bad submission, and
+`404 NOT_FOUND` for an order id that was deleted.
+
+The full lifecycle was walked in a browser as well: create, list, open, edit
+(the form arrives prefilled, a row is removed, the running total follows),
+save, then a two-step delete that redirects to an empty list. An order dated in
+the past shows **Overdue** without anything having been written to it.
 
 ## Current status
 
@@ -223,10 +259,11 @@ Implemented:
 - Gated routes and a server-side `require_user` gate for later features
 - Orders and line items: schema, integer-cent money, validation, and creation
 - A dynamic line-item editor with a live total computed by the server's own code
+- Order list, detail, edit, and delete, each scoped to the owner
+- Derived status: pending, partially paid, paid, and overdue
 
 Not yet implemented:
 
-- Order list, edit, and delete; derived status
 - Payments, amount due, and payment history
 - Dashboard and status filter; REST API
 - Deployment and the deployed URL

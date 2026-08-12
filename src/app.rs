@@ -15,11 +15,10 @@
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
 use leptos_router::components::{Outlet, ParentRoute, Route, Router, Routes, A};
-use leptos_router::hooks::use_params_map;
 use leptos_router::path;
 
 use crate::auth::{provide_auth, AccountNav, AuthPage, Protected};
-use crate::orders::OrderEditor;
+use crate::orders::{EditOrderPage, OrderDetailPage, OrderEditor, OrdersPage};
 
 /// Renders the full HTML document for every server-rendered response.
 ///
@@ -85,8 +84,10 @@ pub fn App() -> impl IntoView {
                 <ParentRoute path=path!("") view=Shell>
                     <Route path=path!("") view=DashboardPage />
                     <Route path=path!("orders") view=OrdersPage />
+                    // Before `orders/:id`, or "new" would be matched as an id.
                     <Route path=path!("orders/new") view=NewOrderPage />
                     <Route path=path!("orders/:id") view=OrderDetailPage />
+                    <Route path=path!("orders/:id/edit") view=EditOrderPage />
                 </ParentRoute>
             </Routes>
         </Router>
@@ -278,36 +279,12 @@ fn DashboardPage() -> impl IntoView {
 }
 
 #[component]
-fn OrdersPage() -> impl IntoView {
-    view! {
-        <Title text="Orders - Orders and Settlements" />
-        <h1>"Orders"</h1>
-        <p>"The owned-order list, derived status, and delete action arrive in Feature 5."</p>
-    }
-}
-
-#[component]
 fn NewOrderPage() -> impl IntoView {
     view! {
         <Title text="New order - Orders and Settlements" />
         <h1>"New order"</h1>
         <p>"Totals are calculated on the server from the values you enter here."</p>
         <OrderEditor />
-    }
-}
-
-#[component]
-fn OrderDetailPage() -> impl IntoView {
-    // Reads the segment now so the parameterised route is proven end to end;
-    // Feature 5 swaps this for a resource keyed on the same value.
-    let params = use_params_map();
-    let id = move || params.read().get("id").unwrap_or_default();
-
-    view! {
-        <Title text="Order - Orders and Settlements" />
-        <h1>"Order detail"</h1>
-        <p>"Requested order: " <code>{id}</code></p>
-        <p>"Line items, payment history, and amount due arrive in Features 5 and 7."</p>
     }
 }
 
