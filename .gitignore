@@ -1,0 +1,18 @@
+# Rust and cargo-leptos build output (target/ also contains target/site).
+/target
+
+# Local environment. Copy .env.example to .env; cargo-leptos loads it
+# automatically. Never commit real credentials.
+.env
+.env.local
+
+# Playwright / end-to-end tooling arrives in Feature 10.
+node_modules
+/end2end/test-results
+/end2end/playwright-report
+
+*.log
+.DS_Store
+
+# Internal working notes, kept out of the submission.
+IMPLEMENTATION_PLAN.md
