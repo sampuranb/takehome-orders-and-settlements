@@ -59,20 +59,26 @@ ssr = [
 ]
 
 [package.metadata.leptos]
-# Produces target/site/pkg/orders.js and orders_bg.wasm.
+# Produces target/site/pkg/orders.js, orders.wasm, and orders.css.
 output-name = "orders"
 site-root = "target/site"
 site-pkg-dir = "pkg"
 site-addr = "127.0.0.1:3000"
 reload-port = 3001
-env = "DEV"
 bin-features = ["ssr"]
 bin-default-features = false
 lib-features = ["hydrate"]
 lib-default-features = false
 lib-profile-release = "wasm-release"
-# `style-file` and `assets-dir` are intentionally absent: both are optional in
-# cargo-leptos, and this feature ships no stylesheet or static assets yet.
+# Plain CSS is read straight through (no Sass toolchain), minified by Lightning
+# CSS in release builds, and published at /pkg/<output-name>.css — the href the
+# <Stylesheet> tag in src/app.rs uses. `hash-files` stays at its default of
+# false, so that href is stable. This key is also what enables CSS hot reload:
+# cargo-leptos only watches a stylesheet declared as `style-file`.
+style-file = "style/main.css"
+# `assets-dir` is still intentionally absent: this application ships no static
+# files beyond the generated bundle, and cargo-leptos wipes anything in
+# site-root outside pkg/ on each rebuild.
 
 [profile.wasm-release]
 inherits = "release"

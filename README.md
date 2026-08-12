@@ -85,10 +85,25 @@ cannot serve.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Readiness probe; `200` when PostgreSQL answers, `503` when it does not |
-| `GET` | `/` | Server-rendered application shell |
-| `GET` | `/pkg/*` | Hydration bundle and static assets |
+| `GET` | `/` | Dashboard |
+| `GET` | `/orders` | Order list |
+| `GET` | `/orders/new` | Order editor |
+| `GET` | `/orders/:id` | Order detail |
+| `GET` | `/pkg/*` | Hydration bundle and stylesheet |
 
-The REST API for orders and payments arrives with those features.
+Application pages are server-rendered and then hydrated. Unmatched paths return
+`404` with the same shell. The pages are placeholders until their features land;
+the REST API for orders and payments arrives with those features.
+
+## Third-party assets
+
+`style/main.css` begins with [Pico CSS](https://picocss.com) v2.1.1, vendored
+verbatim under the MIT licence with its copyright banner intact. It is vendored
+rather than fetched from a CDN so the application makes no third-party requests.
+
+Note that the published `/pkg/orders.css` does **not** carry that banner:
+cargo-leptos processes the stylesheet with Lightning CSS, which strips every
+comment. The notice is retained here and in the source file.
 
 ## Tests
 
