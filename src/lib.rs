@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Shared crate root.
 //!
 //! Compiled twice by cargo-leptos: natively with the `ssr` feature (linked into

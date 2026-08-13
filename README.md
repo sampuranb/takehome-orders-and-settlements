@@ -71,33 +71,37 @@ origin is refused with `403`.
 
 ## Running in Docker
 
-The application and its PostgreSQL come up together. The build is a single
-`docker build` — no Node toolchain, no npm install, nothing to install on the
-host but Docker itself.
+The standalone stack includes Orders, Better Auth, and a separate PostgreSQL
+database for each service. Docker is the only application toolchain required;
+the setup script generates random secrets, builds both images, runs migrations,
+waits for readiness, and verifies a real signup/session flow.
 
 ```bash
-docker compose up --build
+./scripts/setup.sh
 ```
 
-Then browse to **<http://localhost:5174>**, the same address and for the same
-reason as above.
+Then browse to **<http://localhost:5174>**. Better Auth is available at
+<http://localhost:3005>; account creation is enabled and identities persist in
+the `auth-data` Docker volume. Orders data persists separately in `app-data`.
 
-`compose.yaml` deliberately does **not** run a copy of the shared Better Auth
-service. That service is a separate deployment with its own database and its own
-secret; a second copy would mean two user tables and two session stores, and an
-account created against one could not sign in to the other. The container's
-`BETTER_AUTH_URL` defaults to `http://host.docker.internal:3005`, which is the
-auth service running on the developer's own machine; point it anywhere else with
+Re-running setup preserves `.env`, accounts, and application data:
 
 ```bash
-AUTH_SERVICE_URL=https://auth.example.com docker compose up --build
+./scripts/setup.sh --skip-build
 ```
 
-The override is spelled `AUTH_SERVICE_URL` rather than `BETTER_AUTH_URL`
-because compose substitutes `${...}` from `./.env` — the local *development*
-file, where `BETTER_AUTH_URL` is `http://localhost:3005`, an address that inside
-a container means the container itself. Sharing the name would quietly pull that
-value in and fail every sign-in with `503`.
+Use `docker compose down` to stop the stack without deleting data. The script
+never runs `down -v`, overwrites an existing `.env`, or uploads secrets. The
+Better Auth build is pinned to an immutable commit from the public combined
+suite, so a clone or GitHub ZIP remains reproducible without duplicating auth
+source across repositories.
+
+The default auth port is shared by all standalone repositories. Override it on
+the first run when another stack already uses port 3005:
+
+```bash
+AUTH_PORT=13005 ./scripts/setup.sh
+```
 
 The image is built in two stages. The builder is `rust:1.97-slim-bookworm` and
 installs `cargo-leptos` at a pinned version; the runtime is

@@ -1,89 +1,80 @@
-# This application and its own PostgreSQL.
-#
-# The shared Better Auth service is deliberately **not** here. It is a separate
-# deployment with its own database and its own secret, and running a second copy
-# of it from this file would mean two user tables, two session stores, and an
-# account created against one that cannot sign in to the other. Point
-# `BETTER_AUTH_URL` at the one that already exists.
-#
-#   docker compose up --build
-#
-# Then browse to http://localhost:5174 — `localhost`, not `127.0.0.1`. They are
-# different origins to both the browser and Better Auth, and the shared auth
-# service only trusts `http://localhost:5174`.
+name: ${COMPOSE_PROJECT_NAME:-takehome-orders}
 
 services:
+  auth-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:?Run scripts/setup.sh first}
+      POSTGRES_DB: auth
+    volumes:
+      - auth-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth -d auth"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    networks: [auth-db]
+
+  auth:
+    build:
+      context: "https://github.com/sampuranb/takehome-suite.git#00478b07258c418d0e03bab2a050e19c7efca77f:services/shared-auth"
+    restart: unless-stopped
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    environment:
+      PORT: 3005
+      DATABASE_URL: postgresql://auth:${AUTH_DB_PASSWORD}@auth-db:5432/auth
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Run scripts/setup.sh first}
+      BETTER_AUTH_URL: http://localhost:${AUTH_PORT:-3005}
+      TRUSTED_ORIGINS: http://localhost:${AUTH_PORT:-3005},http://localhost:${APP_PORT:-5174}
+    ports:
+      - "127.0.0.1:${AUTH_PORT:-3005}:3005"
+    networks: [edge, auth-db, shared-auth]
+
   db:
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-takehome}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-takehome}
-      POSTGRES_DB: ${POSTGRES_DB:-orders_settlements}
-    # Published on a non-default port so this database and the shared auth
-    # service's database can both run on one machine without a collision.
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?Run scripts/setup.sh first}
+      POSTGRES_DB: orders
     volumes:
-      - orders_postgres_data:/var/lib/postgresql/data
-    # Not decoration: the application connects and runs its migrations *before*
-    # it binds a listener, so a container that starts against a database still
-    # initialising exits rather than waiting. `depends_on` alone only waits for
-    # the container to start, which is not the same as the server accepting
-    # connections.
+      - app-data:/var/lib/postgresql/data
     healthcheck:
-      test:
-        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-takehome} -d ${POSTGRES_DB:-orders_settlements}"]
-      interval: 2s
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 3s
       timeout: 5s
-      retries: 15
+      retries: 30
+    networks: [app-db]
 
   app:
-    build:
-      context: .
+    build: .
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+      auth:
+        condition: service_healthy
     environment:
-      # `db` is the compose service name, resolved on the internal network. The
-      # published port above is for a psql on the host, not for this.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-takehome}:${POSTGRES_PASSWORD:-takehome}@db:5432/${POSTGRES_DB:-orders_settlements}
-      # The browser never calls Better Auth directly — this application does,
-      # server-side, and re-emits the session cookie on its own origin. So this
-      # address only has to be reachable from this container, and on a real
-      # deployment it can stay private. `host.docker.internal` is the auth
-      # service running on the host during development.
-      #
-      # The override is spelled `AUTH_SERVICE_URL` and not `BETTER_AUTH_URL` on
-      # purpose. Compose interpolates `${...}` from `./.env`, which is the local
-      # *development* file — and there `BETTER_AUTH_URL` is `http://localhost:3005`,
-      # an address that inside a container means the container itself. Sharing
-      # the name would silently substitute it and every sign-in would fail with
-      # `503`, from a file this one never mentions.
-      BETTER_AUTH_URL: ${AUTH_SERVICE_URL:-http://host.docker.internal:3005}
+      DATABASE_URL: postgresql://orders:${APP_DB_PASSWORD}@db:5432/orders
+      BETTER_AUTH_URL: http://auth:3005
       RUST_LOG: ${RUST_LOG:-info,orders_and_settlements=info,tower_http=info}
-    # Only needed for the `host.docker.internal` default above; harmless
-    # otherwise, and it is what lets the containerised app reach an auth service
-    # running on the developer's own machine.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
-      # 5174 on the host because that is the origin Better Auth trusts. The
-      # container listens on 8080, as the Dockerfile sets.
-      - "${APP_PORT:-5174}:8080"
-    # No healthcheck on this service, deliberately. A container-side check has
-    # to run *inside* the runtime image, which ships no curl, no wget, and a
-    # `/bin/sh` that is dash and has no `/dev/tcp` — so every one-liner that
-    # looks like it would work here silently reports unhealthy instead.
-    #
-    # `/health` still exists and still answers 503 when PostgreSQL is
-    # unreachable. Point the platform's own probe at it:
-    #
-    #   curl -fsS http://localhost:5174/health
-    #
-    # which is where a health check that means anything runs anyway — from
-    # outside the thing being checked.
+      - "127.0.0.1:${APP_PORT:-5174}:8080"
+    networks: [edge, app-db, shared-auth]
+
+networks:
+  edge:
+  shared-auth:
+    internal: true
+  auth-db:
+    internal: true
+  app-db:
+    internal: true
 
 volumes:
-  orders_postgres_data:
+  auth-data:
+  app-data:
