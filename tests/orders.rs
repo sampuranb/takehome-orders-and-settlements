@@ -32,6 +32,8 @@ use orders_and_settlements::orders::{
     validate_create_order, NewOrderInput, OrderItemInput, OrderStatus, ValidatedItem,
     ValidatedOrder, MAX_ITEMS,
 };
+use orders_and_settlements::payments::ssr::record_payment_service;
+use orders_and_settlements::payments::NewPaymentInput;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -769,6 +771,250 @@ async fn deleting_an_order_takes_its_line_items_with_it() {
         delete_order_service(&pool, &owner, order_id)
             .await
             .expect_err("it is already gone"),
+        AppError::NotFound
+    );
+
+    cleanup(&pool, &owner).await;
+}
+
+// ---------------------------------------------------------------------------
+// The complete detail view
+//
+// One read has to produce everything the page shows: the items in the order
+// they were saved, every payment newest first, and totals that reconcile with
+// the payments listed beneath them. These assert the read, not the rendering —
+// a component can only be as correct as the DTO it is handed.
+// ---------------------------------------------------------------------------
+
+fn payment(amount: &str, paid_on: &str) -> NewPaymentInput {
+    NewPaymentInput {
+        amount: amount.to_string(),
+        paid_on: paid_on.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn line_items_come_back_in_the_order_they_were_saved() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    // Descriptions deliberately not in alphabetical order, and prices
+    // deliberately not ascending, so a query that happened to sort by either
+    // would produce a different sequence than this one.
+    let order_id = create_order_service(
+        &pool,
+        &owner,
+        &order(vec![
+            item("Zebra", "1", "5.00"),
+            item("Apple", "1", "1.00"),
+            item("Mango", "1", "9.00"),
+        ]),
+    )
+    .await
+    .expect("the order is valid");
+
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("readable");
+
+    let descriptions: Vec<&str> = detail
+        .items
+        .iter()
+        .map(|line| line.description.as_str())
+        .collect();
+    assert_eq!(descriptions, vec!["Zebra", "Apple", "Mango"]);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn the_payment_history_is_newest_first() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(&pool, &owner, &order(vec![item("Work", "1", "300.00")]))
+        .await
+        .expect("the order is valid");
+
+    // Recorded out of date order, so "newest first" cannot be satisfied by
+    // accident by insertion order.
+    for (amount, paid_on) in [
+        ("100.00", "2026-02-01"),
+        ("50.00", "2026-04-01"),
+        ("25.00", "2026-03-01"),
+    ] {
+        record_payment_service(&pool, &owner, order_id, &payment(amount, paid_on))
+            .await
+            .expect("within the balance");
+    }
+
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("readable");
+
+    let dates: Vec<String> = detail
+        .payments
+        .iter()
+        .map(|paid| paid.paid_on.to_string())
+        .collect();
+    assert_eq!(dates, vec!["2026-04-01", "2026-03-01", "2026-02-01"]);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn payments_on_the_same_day_keep_one_stable_order() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(&pool, &owner, &order(vec![item("Work", "1", "300.00")]))
+        .await
+        .expect("the order is valid");
+
+    // Three payments with nothing to tell them apart but the id. Without the
+    // tiebreak the database is free to return them in any order, and the
+    // history would shuffle between two reads of the same page.
+    for amount in ["10.00", "20.00", "30.00"] {
+        record_payment_service(&pool, &owner, order_id, &payment(amount, "2026-05-05"))
+            .await
+            .expect("within the balance");
+    }
+
+    let first = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("readable");
+    let second = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("readable again");
+
+    assert_eq!(
+        first.payments, second.payments,
+        "the order is deterministic"
+    );
+
+    // Ids are v7, so descending id is "recorded later first" — which for
+    // same-day payments is the only sequence that means anything.
+    let amounts: Vec<i64> = first
+        .payments
+        .iter()
+        .map(|paid| paid.amount_cents)
+        .collect();
+    assert_eq!(amounts, vec![3_000, 2_000, 1_000]);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn the_history_adds_up_to_the_totals_printed_above_it() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(
+        &pool,
+        &owner,
+        &order(vec![item("Consulting", "2", "500.00")]),
+    )
+    .await
+    .expect("the order is valid");
+
+    for amount in ["400.00", "150.50", "49.50"] {
+        record_payment_service(&pool, &owner, order_id, &payment(amount, "2026-06-01"))
+            .await
+            .expect("within the balance");
+    }
+
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("readable");
+
+    // The whole reason the payments and the totals travel on one DTO: a page
+    // that fetched them separately could print a list that does not sum to the
+    // figure above it.
+    let listed: i64 = detail.payments.iter().map(|paid| paid.amount_cents).sum();
+    assert_eq!(listed, detail.paid_cents, "the list sums to what was paid");
+    assert_eq!(
+        detail.paid_cents + detail.amount_due_cents(),
+        detail.total_cents,
+        "paid plus due is the total"
+    );
+    assert_eq!(detail.paid_cents, 60_000);
+    assert_eq!(detail.amount_due_cents(), 40_000);
+    assert_eq!(detail.status, OrderStatus::PartiallyPaid);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn an_unpaid_order_has_an_empty_history_and_every_action() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(&pool, &owner, &order(vec![item("Work", "1", "10.00")]))
+        .await
+        .expect("the order is valid");
+
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("readable");
+
+    assert!(detail.payments.is_empty(), "nothing has been paid");
+    assert_eq!(detail.paid_cents, 0);
+    // Both conditional actions are live: the order can still be changed, and
+    // there is a balance to pay.
+    assert!(detail.editable);
+    assert_eq!(detail.amount_due_cents(), 1_000);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn a_settled_order_offers_no_payment_and_no_edit() {
+    let pool = connect().await;
+    let owner = test_owner();
+
+    let order_id = create_order_service(&pool, &owner, &order(vec![item("Work", "1", "80.00")]))
+        .await
+        .expect("the order is valid");
+
+    record_payment_service(&pool, &owner, order_id, &payment("80.00", "2026-07-07"))
+        .await
+        .expect("settles it");
+
+    let detail = find_order_for_user(&pool, &owner, order_id)
+        .await
+        .expect("readable");
+
+    assert_eq!(detail.status, OrderStatus::Paid);
+    // Nothing left to pay, so the form has nothing to offer...
+    assert_eq!(detail.amount_due_cents(), 0);
+    // ...and money has moved, so the record is no longer the caller's to edit.
+    assert!(!detail.editable);
+    assert_eq!(detail.payments.len(), 1);
+
+    cleanup(&pool, &owner).await;
+}
+
+#[tokio::test]
+async fn a_stranger_cannot_read_the_payment_history() {
+    let pool = connect().await;
+    let owner = test_owner();
+    let stranger = test_owner();
+
+    let order_id = create_order_service(&pool, &owner, &order(vec![item("Work", "1", "10.00")]))
+        .await
+        .expect("the order is valid");
+
+    record_payment_service(&pool, &owner, order_id, &payment("4.00", "2026-07-07"))
+        .await
+        .expect("within the balance");
+
+    // The payment query itself is not owner-scoped — it is reached only through
+    // this read, which is. The ownership check has to hold here or it holds
+    // nowhere.
+    assert_eq!(
+        find_order_for_user(&pool, &stranger, order_id)
+            .await
+            .expect_err("not the stranger's order"),
         AppError::NotFound
     );
 

@@ -231,6 +231,24 @@ Once an order has any payment, it can no longer be edited or deleted. That check
 runs inside the same transaction, after the same lock, so it cannot be raced
 either.
 
+The order detail page is one read. `find_order_for_user` issues three statements
+— the order, its line items in saved position order, and its payments newest
+first — and returns them on a single DTO. Three statements rather than a join,
+because joining items to payments multiplies them: a four-line order with three
+payments would come back as twelve rows describing seven facts. They are not in
+a transaction and do not need to be; nothing here decides anything, and the
+write path re-reads what it needs behind the row lock rather than trusting a
+number a page produced.
+
+The history and the totals travel together for the same reason they are read
+together: a page that fetched them separately could print a list of payments
+that does not sum to the "Paid" figure above it. The last row of the history is
+that sum, so the reconciliation is visible rather than left to the reader.
+
+Payments on the same day are ordered by id, which is UUID v7 — so the tiebreak
+means "recorded later", not an arbitrary byte comparison, and two reads of the
+same page cannot shuffle the rows.
+
 ## Third-party assets
 
 `style/main.css` begins with [Pico CSS](https://picocss.com) v2.1.1, vendored
@@ -290,6 +308,11 @@ with the reason they are gone; $700 is refused in place with "The most you can
 pay is $600.00."; $600 settles it to **Paid**, $0.00 due, with the payment form
 replaced by a statement that nothing is owed.
 
+The history was watched appearing rather than only reloaded into: an order with
+no payments shows no history section at all, the first payment makes it appear
+in place without a page load, and a second payment on the same day is inserted
+above the first with the footer moving to "2 payments" and the new sum.
+
 ## Current status
 
 Implemented:
@@ -310,10 +333,10 @@ Implemented:
 - Derived status: pending, partially paid, paid, and overdue
 - Payments and amount due, with overpayment refused under concurrency
 - Orders locked against edit and delete once money is recorded against them
+- One authoritative detail view: items, payment history, totals, and actions
 
 Not yet implemented:
 
-- Payment history on the order detail page
 - Dashboard and status filter; REST API
 - Deployment and the deployed URL
 

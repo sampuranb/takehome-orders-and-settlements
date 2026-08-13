@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use chrono::NaiveDate;
 use uuid::Uuid;
 
-use crate::app::{format_cents, FieldError};
+use crate::app::{format_cents, FieldError, MoneyText};
 use crate::error::{AppError, AppResult};
 use crate::orders::{parse_due_date, parse_money_to_cents};
 
@@ -476,6 +476,83 @@ pub fn PaymentForm(
             </div>
         </form>
     }
+}
+
+/// Every payment against one order, newest first, ending in what they add up to.
+///
+/// The running total is the point of the last row. A history that lists three
+/// payments and leaves the reader to add them up is not a reconciliation, and
+/// the figure printed here is the same `paid_cents` the totals above the history
+/// use — it comes from the same read, so the list and the sum cannot disagree.
+///
+/// Renders nothing at all when there are no payments. An empty table with a
+/// "no payments yet" row says less than the payment form directly above it,
+/// which already implies the same thing.
+///
+/// `Option` rather than an early `return ().into_any()`. This view has to swap
+/// from nothing to a table the moment the first payment is recorded, and a
+/// `None` leaves a placeholder node in the DOM for the table to be inserted
+/// against. It is the same shape the conditional notices in
+/// [`crate::orders::OrderDetailView`] use, for the same reason.
+///
+/// Not `<For>`: these rows carry no per-row signal to preserve, and the whole
+/// view is rebuilt from a fresh [`crate::orders::OrderDetail`] each time the
+/// resource resolves. Keying would buy nothing here. The line-item editor keys
+/// its rows because they *are* signals; this one has nothing to lose.
+#[component]
+pub fn PaymentHistory(payments: Vec<PaymentRecord>, paid_cents: i64) -> impl IntoView {
+    let count = payments.len();
+
+    (count > 0).then(move || {
+        view! {
+        <section class="payment-history">
+            <h2>"Payments"</h2>
+
+            <table class="order-table">
+                <thead>
+                    <tr>
+                        <th scope="col">"Paid on"</th>
+                        <th scope="col">"Amount"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {payments
+                        .into_iter()
+                        .map(|payment| {
+                            view! {
+                                <tr>
+                                    // ISO 8601, because `Display` on `NaiveDate`
+                                    // already produces it and `format()` needs
+                                    // chrono's `alloc`, which the browser build
+                                    // deliberately omits. The two would render
+                                    // the same string anyway.
+                                    <td>{payment.paid_on.to_string()}</td>
+                                    <td>
+                                        <MoneyText cents=payment.amount_cents />
+                                    </td>
+                                </tr>
+                            }
+                        })
+                        .collect::<Vec<_>>()}
+                </tbody>
+                <tfoot>
+                    <tr>
+                        <th scope="row">
+                            {if count == 1 {
+                                "1 payment".to_string()
+                            } else {
+                                format!("{count} payments")
+                            }}
+                        </th>
+                        <td>
+                            <MoneyText cents=paid_cents />
+                        </td>
+                    </tr>
+                </tfoot>
+            </table>
+        </section>
+        }
+    })
 }
 
 #[cfg(test)]

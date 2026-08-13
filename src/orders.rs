@@ -35,7 +35,9 @@ use uuid::Uuid;
 
 use crate::app::{FieldError, MoneyText, StatusBadge};
 use crate::error::{AppError, AppResult};
-use crate::payments::{calculate_maximum_payment_cents, PaymentForm, RecordPayment};
+use crate::payments::{
+    calculate_maximum_payment_cents, PaymentForm, PaymentHistory, PaymentRecord, RecordPayment,
+};
 
 /// Upper bound on line items in one order.
 ///
@@ -157,6 +159,13 @@ pub struct OrderDetail {
     /// opinion, and it is the one that can be wrong.
     pub today: NaiveDate,
     pub items: Vec<OrderLine>,
+    /// Every payment against this order, newest first.
+    ///
+    /// Carried on the same DTO as the totals rather than fetched separately, so
+    /// the history and the `paid_cents` it adds up to are read in the same
+    /// request and cannot disagree. A second resource would let the page show a
+    /// list of payments whose sum is not the figure printed above it.
+    pub payments: Vec<PaymentRecord>,
 }
 
 impl OrderDetail {
@@ -778,11 +787,21 @@ pub mod ssr {
             .collect())
     }
 
-    /// One order with its line items, or [`AppError::NotFound`].
+    /// One order with its line items and its payments, or [`AppError::NotFound`].
     ///
-    /// Two statements rather than a join: a join between an order and its items
-    /// returns the order's columns once per item, and reassembling that is more
-    /// code than the round trip saves for a single order.
+    /// Three statements rather than a join: a join between an order and its
+    /// items returns the order's columns once per item, and reassembling that is
+    /// more code than the round trip saves for a single order. Adding payments
+    /// to that join is worse than additive — items multiply by payments, so a
+    /// four-line order with three payments comes back as twelve rows describing
+    /// seven facts.
+    ///
+    /// The three reads are not in a transaction and do not need to be. Nothing
+    /// here decides anything: it is a snapshot for a page, and the write path
+    /// that must not race —
+    /// [`crate::payments::ssr::record_payment_transaction`] — re-reads
+    /// everything it needs behind [`lock_owned_order`] rather than trusting a
+    /// number this function produced.
     pub async fn find_order_for_user(
         pool: &PgPool,
         owner_user_id: &str,
@@ -820,6 +839,11 @@ pub mod ssr {
         .fetch_all(pool)
         .await?;
 
+        // Ownership was already established by the order query above, which
+        // returned `NotFound` for a row that is not the caller's. This runs on
+        // an id that has been proven, which is why it takes no owner.
+        let payments = crate::payments::ssr::list_payments_for_order(pool, order_id).await?;
+
         // One `today` for the status and for the value sent to the browser, so
         // a page cannot show a date the status was not derived against.
         let today = today();
@@ -833,6 +857,7 @@ pub mod ssr {
             due_date: order.due_date,
             total_cents: order.total_cents,
             paid_cents: order.paid_cents,
+            payments,
             items: items
                 .into_iter()
                 .map(|row| OrderLine {
@@ -1697,6 +1722,11 @@ fn OrderDetailView(
     let order_id = order.id;
     let editable = order.editable;
     let today = order.today;
+    let paid_cents = order.paid_cents;
+    // Read before the move below, because taking `payments` out of `order`
+    // leaves it partially moved and it can no longer be borrowed as a whole.
+    let amount_due_cents = order.amount_due_cents();
+    let payments = order.payments;
     // Computed by the same function the transaction uses, so the hint on the
     // form and the limit the server enforces are one rule, not two.
     let maximum_cents = calculate_maximum_payment_cents(order.total_cents, order.paid_cents);
@@ -1753,9 +1783,14 @@ fn OrderDetailView(
             </dd>
             <dt>"Amount due"</dt>
             <dd>
-                <MoneyText cents=order.amount_due_cents() />
+                <MoneyText cents=amount_due_cents />
             </dd>
         </dl>
+
+        // Immediately below the totals it reconciles, and above the form that
+        // adds to it, so the page reads as: what is owed, what has been paid,
+        // and what you can do about the difference.
+        <PaymentHistory payments paid_cents />
 
         {move || {
             (!editable)

@@ -183,6 +183,30 @@ nav a[aria-current="page"] {
   text-align: right;
 }
 
+/* Payment history. Two columns, so the amount is the *last* column rather than
+ * the fourth, and the .order-table rule above (which right-aligns from column 4
+ * on) does not reach it. Aligning on the last child covers both tables without
+ * either needing to know how many columns the other has. */
+.payment-history td:last-child,
+.payment-history th:last-child {
+  text-align: right;
+}
+
+/* Narrower than the line items above it: two short columns stretched across a
+ * wide page put the date and the amount at opposite ends of the screen, which
+ * is exactly the comparison this table exists to make easy. */
+.payment-history .order-table {
+  max-width: 24rem;
+}
+
+/* The reconciling total. Bordered off from the payments above it because it is
+ * a different kind of row — a sum of the table, not another entry in it. */
+.payment-history tfoot th,
+.payment-history tfoot td {
+  border-top: 2px solid var(--pico-table-border-color);
+  font-weight: 600;
+}
+
 /* A statement about the record, not a failure: "this order has payments and can
  * no longer be edited". Distinct from .error-panel, which reports an error. */
 .notice {
