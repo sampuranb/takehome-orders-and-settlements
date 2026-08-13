@@ -33,9 +33,24 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
             <head>
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
-                // Opts the document into Pico's dark-mode block and stops the
-                // browser flashing a light form control before CSS applies.
+                // Tells the browser both schemes are supported before any CSS
+                // parses, so the canvas and the form controls are painted in
+                // the right one instead of flashing white first.
                 <meta name="color-scheme" content="light dark" />
+                // The one blocking font on the page. Preloading it stops the
+                // first paint being drawn in the fallback stack and then
+                // reflowed; the two mono weights are not preloaded because they
+                // set amounts below the fold and `swap` covers them.
+                <link
+                    rel="preload"
+                    href="/fonts/ibm-plex-sans-latin-var.woff2"
+                    // A raw identifier because `as` is a Rust keyword and the
+                    // view macro parses attribute names as identifiers. The
+                    // `r#` is stripped before the attribute is written out.
+                    r#as="font"
+                    type="font/woff2"
+                    crossorigin="anonymous"
+                />
                 <AutoReload options=options.clone() />
                 <HydrationScripts options />
                 <MetaTags />
@@ -168,36 +183,45 @@ fn Chrome(children: Children) -> impl IntoView {
             "Skip to main content"
         </a>
 
-        <header class="container">
-            <nav aria-label="Primary">
-                <ul>
-                    <li>
-                        <strong>"Orders and Settlements"</strong>
-                    </li>
-                </ul>
-                <ul>
-                    // `exact` matters only on "/": without it the dashboard
-                    // link would report itself as current on every page.
-                    <li>
-                        <A href="/" exact=true>
-                            "Dashboard"
-                        </A>
-                    </li>
-                    <li>
-                        <A href="/orders/new">"New order"</A>
-                    </li>
-                    // Resolves asynchronously and renders nothing until it
-                    // does, so the rest of the navigation never waits on the
-                    // auth service to become interactive.
-                    <AccountNav />
-                </ul>
-            </nav>
+        <header class="masthead">
+            <div class="container masthead-inner">
+                // Three spans rather than one string, so the conjunction can be
+                // set apart from the two nouns. A screen reader still announces
+                // "Orders and Settlements" — the spans are typography, not
+                // structure, and the accessible name is unchanged.
+                <p class="wordmark">
+                    <span>"Orders"</span>
+                    <span class="wordmark-conjunction">"and"</span>
+                    <span>"Settlements"</span>
+                </p>
+
+                <nav aria-label="Primary">
+                    <ul class="nav-list">
+                        // `exact` matters only on "/": without it the dashboard
+                        // link would report itself as current on every page.
+                        <li>
+                            <A href="/" exact=true>
+                                "Dashboard"
+                            </A>
+                        </li>
+                        <li>
+                            <A href="/orders/new">"New order"</A>
+                        </li>
+                        // Resolves asynchronously and renders nothing until it
+                        // does, so the rest of the navigation never waits on
+                        // the auth service to become interactive.
+                        <AccountNav />
+                    </ul>
+                </nav>
+            </div>
         </header>
 
         <main id="main" class="container">{children()}</main>
 
-        <footer class="container">
-            <small>"Internal tool. Amounts are stored and calculated in cents."</small>
+        <footer class="site-footer">
+            <div class="container">
+                <small>"Internal tool. Amounts are stored and calculated in cents."</small>
+            </div>
         </footer>
     }
 }

@@ -470,9 +470,9 @@ browser, so a pasted `/?status=overdue` is server-rendered as the overdue list
 by the same code path, instead of arriving as everything and flickering down to
 a subset once the WASM bundle loads.
 
-The four tiles always describe **every** order the caller owns, whatever filter
-is applied — they are the reason to click a filter, so they have to keep
-reporting what is there. "Outstanding" is the sum of each order's own amount
+The four figures in the summary strip always describe **every** order the caller
+owns, whatever filter is applied — they are the reason to click a filter, so
+they have to keep reporting what is there. "Outstanding" is the sum of each order's own amount
 due, clamped at zero, not `billed - paid`: a credit on an overpaid invoice must
 not quietly pay down a different customer's balance.
 
@@ -480,15 +480,64 @@ Two empty states, because they are two different facts with two different next
 actions: "no orders yet", which offers the create form, and "no overdue
 orders", which offers a way back to the full list.
 
+## Design
+
+`style/main.css` is written for this application. It replaced Pico CSS, which
+carried the interface from Feature 1 to Feature 10 and was the right thing to
+start with — a classless framework gives you a usable page for nothing. It is
+the wrong thing to finish with, because it also decides the density, the palette
+and the type, and in a tool whose entire job is showing somebody what they are
+owed, those are the decisions that matter. The replacement is 21 KB against
+Pico's 83 KB, and there is no framework left underneath it.
+
+Three rules account for most of the file.
+
+**Rules, not shadows.** Separation is done with 1px lines. A ledger is a ruled
+document, and elevation is a metaphor for cards that float — these do not. The
+dashboard's four figures are one bordered panel divided by hairlines rather than
+four drop-shadowed tiles, and the divisions are a 1px grid gap showing the
+panel's own background through, so they land correctly however the cells wrap.
+
+**Figures are typeset.** Every amount is set in IBM Plex Mono with lining
+tabular figures and right-aligned, so the digits of two totals sit above one
+another and a wrong order of magnitude is visible without reading the number.
+Dates get the same treatment for the same reason. The type is IBM Plex Sans and
+Mono because Plex's tabular figures are real rather than approximated, and
+because its two families were drawn to sit together.
+
+**Density is the feature.** Table rows are 36px, cards are padded 12–16px, body
+text is 15px and table text 13px. The exception is touch: on a coarse pointer
+every control grows to the 44px minimum and the rows loosen with them, which is
+the only place the two diverge.
+
+The palette is a warm paper neutral rather than the cool grey that is every
+framework's default, and the accent is a deep ink teal at 9.3:1 on white. Both
+schemes are defined as tokens at the top of the file and nothing below them
+names a hex value, so a border cannot be visible in light mode and invisible in
+dark. Status is never carried by colour alone: every badge has its label, an
+overdue row is ruled down its leading edge *and* says "Overdue", and a rejected
+field is tinted *and* has its message underneath.
+
+There is no hero, no row of three feature cards, no decorative iconography, no
+gradient and no scroll-triggered motion. The only animation is a 700ms spinner
+on genuinely pending work and a 160ms colour transition on hover and focus, both
+of which `prefers-reduced-motion` removes. `forced-colors` and `print` each get
+a short block: an order is a document somebody prints and staples to something.
+
 ## Third-party assets
 
-`style/main.css` begins with [Pico CSS](https://picocss.com) v2.1.1, vendored
-verbatim under the MIT licence with its copyright banner intact. It is vendored
-rather than fetched from a CDN so the application makes no third-party requests.
+**IBM Plex Sans and IBM Plex Mono**, Copyright 2017 IBM Corp, under the [SIL
+Open Font License 1.1](https://scripts.sil.org/OFL). Three files in
+`assets/fonts/` — one variable sans covering weights 100–700 at 40 KB, and two
+static mono weights at 10 KB each — plus the licence text, which
+`assets-dir = "assets"` in `Cargo.toml` publishes at `/fonts/OFL.txt`. They are
+vendored rather than loaded from Google Fonts so the application makes no
+third-party requests and does not depend on a network it does not control.
 
-Note that the published `/pkg/orders.css` does **not** carry that banner:
-cargo-leptos processes the stylesheet with Lightning CSS, which strips every
-comment. The notice is retained here and in the source file.
+The published `/pkg/orders.css` does **not** carry the attribution comment from
+the top of `style/main.css`: cargo-leptos processes the stylesheet with
+Lightning CSS, which strips every comment. That is why the licence ships as a
+file of its own rather than only as a banner.
 
 ## Tests
 
@@ -631,6 +680,10 @@ Implemented:
 - A REST API over the same services, with a documented status and error contract
 - A container image and a one-command compose stack for the app and its database
 - An end-to-end browser test walking the whole lifecycle against a running build
+- A stylesheet written for this application, replacing the CSS framework it was
+  prototyped on: warm paper neutrals, self-hosted IBM Plex, tabular figures on
+  every amount, and both colour schemes defined as tokens. See
+  [Design](#design).
 
 Not yet implemented:
 

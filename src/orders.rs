@@ -1912,116 +1912,156 @@ pub fn OrderEditor(
             <h2>"Line items"</h2>
             <FieldError message=move || message_for("items".to_string()) />
 
-            <table>
-                <thead>
-                    <tr>
-                        <th scope="col">"Description"</th>
-                        <th scope="col">"Quantity"</th>
-                        <th scope="col">"Unit price"</th>
-                        <th scope="col">"Line total"</th>
-                        <th scope="col">"Actions"</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <For each=move || rows.get() key=|row| row.key let:row>
+            <div class="table-scroll">
+                <table class="item-editor">
+                    <thead>
                         <tr>
-                            <td>
-                                <input
-                                    type="text"
-                                    aria-label=move || {
-                                        format!("Item {} description", position_of(row.key) + 1)
-                                    }
-                                    value=move || row.description.get()
-                                    prop:value=move || row.description.get()
-                                    on:input:target=move |event| {
-                                        row.description.set(event.target().value())
-                                    }
-                                />
-                                <FieldError message=move || {
-                                    message_for(
-                                        format!("items[{}].description", position_of(row.key)),
-                                    )
-                                } />
-                            </td>
-                            <td>
-                                <input
-                                    type="text"
-                                    inputmode="numeric"
-                                    aria-label=move || {
-                                        format!("Item {} quantity", position_of(row.key) + 1)
-                                    }
-                                    value=move || row.quantity.get()
-                                    prop:value=move || row.quantity.get()
-                                    on:input:target=move |event| {
-                                        row.quantity.set(event.target().value())
-                                    }
-                                />
-                                <FieldError message=move || {
-                                    message_for(
-                                        format!("items[{}].quantity", position_of(row.key)),
-                                    )
-                                } />
-                            </td>
-                            <td>
-                                <input
-                                    type="text"
-                                    inputmode="decimal"
-                                    placeholder="0.00"
-                                    aria-label=move || {
-                                        format!("Item {} unit price", position_of(row.key) + 1)
-                                    }
-                                    value=move || row.unit_price.get()
-                                    prop:value=move || row.unit_price.get()
-                                    on:input:target=move |event| {
-                                        row.unit_price.set(event.target().value())
-                                    }
-                                />
-                                <FieldError message=move || {
-                                    message_for(
-                                        format!("items[{}].unit_price", position_of(row.key)),
-                                    )
-                                } />
-                            </td>
-                            <td>
-                                {move || match line_total(row) {
-                                    Some(cents) => view! { <MoneyText cents=cents /> }.into_any(),
-                                    None => view! { <span>"—"</span> }.into_any(),
-                                }}
-                            </td>
-                            <td>
-                                <button
-                                    type="button"
-                                    class="secondary outline"
-                                    // The last row is disabled rather than
-                                    // hidden: a control that vanishes under the
-                                    // pointer is worse than one that says no.
-                                    disabled=move || rows.get().len() <= 1
-                                    on:click=move |_| {
-                                        rows.update(|rows| rows.retain(|other| other.key != row.key))
-                                    }
-                                >
-                                    "Remove"
-                                </button>
-                            </td>
+                            <th scope="col">"Description"</th>
+                            <th scope="col">"Quantity"</th>
+                            <th scope="col">"Unit price"</th>
+                            <th scope="col" class="num">
+                                "Line total"
+                            </th>
+                            <th scope="col">
+                                // Named for the assistive-technology reader; the
+                                // column holds one Remove button per row and a
+                                // visible "Actions" header only adds noise beside
+                                // buttons that already say what they do.
+                                <span class="visually-hidden">"Actions"</span>
+                            </th>
                         </tr>
-                    </For>
-                </tbody>
-            </table>
+                    </thead>
+                    <tbody>
+                        <For each=move || rows.get() key=|row| row.key let:row>
+                            <tr>
+                                <td>
+                                    <input
+                                        type="text"
+                                        aria-label=move || {
+                                            format!("Item {} description", position_of(row.key) + 1)
+                                        }
+                                        // The header fields have carried this
+                                        // since Feature 4; the line-item fields
+                                        // had only the message below them, so a
+                                        // rejected row looked like a valid one
+                                        // with a note attached.
+                                        aria-invalid=move || {
+                                            message_for(
+                                                    format!(
+                                                        "items[{}].description",
+                                                        position_of(row.key),
+                                                    ),
+                                                )
+                                                .map(|_| "true")
+                                        }
+                                        value=move || row.description.get()
+                                        prop:value=move || row.description.get()
+                                        on:input:target=move |event| {
+                                            row.description.set(event.target().value())
+                                        }
+                                    />
+                                    <FieldError message=move || {
+                                        message_for(
+                                            format!("items[{}].description", position_of(row.key)),
+                                        )
+                                    } />
+                                </td>
+                                <td>
+                                    <input
+                                        type="text"
+                                        inputmode="numeric"
+                                        aria-label=move || {
+                                            format!("Item {} quantity", position_of(row.key) + 1)
+                                        }
+                                        aria-invalid=move || {
+                                            message_for(
+                                                    format!("items[{}].quantity", position_of(row.key)),
+                                                )
+                                                .map(|_| "true")
+                                        }
+                                        value=move || row.quantity.get()
+                                        prop:value=move || row.quantity.get()
+                                        on:input:target=move |event| {
+                                            row.quantity.set(event.target().value())
+                                        }
+                                    />
+                                    <FieldError message=move || {
+                                        message_for(
+                                            format!("items[{}].quantity", position_of(row.key)),
+                                        )
+                                    } />
+                                </td>
+                                <td>
+                                    <input
+                                        type="text"
+                                        inputmode="decimal"
+                                        placeholder="0.00"
+                                        aria-label=move || {
+                                            format!("Item {} unit price", position_of(row.key) + 1)
+                                        }
+                                        aria-invalid=move || {
+                                            message_for(
+                                                    format!(
+                                                        "items[{}].unit_price",
+                                                        position_of(row.key),
+                                                    ),
+                                                )
+                                                .map(|_| "true")
+                                        }
+                                        value=move || row.unit_price.get()
+                                        prop:value=move || row.unit_price.get()
+                                        on:input:target=move |event| {
+                                            row.unit_price.set(event.target().value())
+                                        }
+                                    />
+                                    <FieldError message=move || {
+                                        message_for(
+                                            format!("items[{}].unit_price", position_of(row.key)),
+                                        )
+                                    } />
+                                </td>
+                                <td class="num">
+                                    {move || match line_total(row) {
+                                        Some(cents) => view! { <MoneyText cents=cents /> }.into_any(),
+                                        None => view! { <span>"—"</span> }.into_any(),
+                                    }}
+                                </td>
+                                <td>
+                                    <button
+                                        type="button"
+                                        class="secondary outline"
+                                        // The last row is disabled rather than
+                                        // hidden: a control that vanishes under the
+                                        // pointer is worse than one that says no.
+                                        disabled=move || rows.get().len() <= 1
+                                        on:click=move |_| {
+                                            rows.update(|rows| rows.retain(|other| other.key != row.key))
+                                        }
+                                    >
+                                        "Remove"
+                                    </button>
+                                </td>
+                            </tr>
+                        </For>
+                    </tbody>
+                </table>
+            </div>
 
-            <button type="button" class="secondary" on:click=add_row>
-                "Add line item"
-            </button>
-
-            <p>
-                "Order total: "
-                {move || match running_total() {
-                    Some(cents) => view! { <MoneyText cents=cents /> }.into_any(),
-                    None => {
-                        view! { <span>"—"</span> }
-                            .into_any()
-                    }
-                }}
-            </p>
+            <div class="editor-total">
+                <button type="button" class="secondary" on:click=add_row>
+                    "Add line item"
+                </button>
+                <p>
+                    "Order total: "
+                    {move || match running_total() {
+                        Some(cents) => view! { <MoneyText cents=cents /> }.into_any(),
+                        None => {
+                            view! { <span>"—"</span> }
+                                .into_any()
+                        }
+                    }}
+                </p>
+            </div>
 
             <div class="form-actions">
                 <button type="submit" aria-busy=move || pending.get().to_string()>
@@ -2136,29 +2176,32 @@ fn StatusFilter(totals: DashboardTotals, current: Option<OrderStatus>) -> impl I
 #[component]
 fn DashboardTiles(totals: DashboardTotals) -> impl IntoView {
     view! {
-        <section class="dashboard-tiles" aria-label="Totals across all orders">
-            <article>
+        <section class="summary" aria-label="Totals across all orders">
+            <div class="summary-cell">
                 <h2>"Orders"</h2>
-                <p class="tile-figure">{totals.order_count}</p>
-            </article>
-            <article>
+                <p class="summary-figure">{totals.order_count}</p>
+            </div>
+            <div class="summary-cell">
                 <h2>"Billed"</h2>
-                <p class="tile-figure">
+                <p class="summary-figure">
                     <MoneyText cents=totals.total_cents />
                 </p>
-            </article>
-            <article>
+            </div>
+            <div class="summary-cell">
                 <h2>"Paid"</h2>
-                <p class="tile-figure">
+                <p class="summary-figure">
                     <MoneyText cents=totals.paid_cents />
                 </p>
-            </article>
-            <article>
+            </div>
+            // The one emphasised figure on the page. Four cells with equal
+            // weight would make the reader choose which number matters; this is
+            // the one they came for, and the tint says so before they read it.
+            <div class="summary-cell" data-emphasis="true">
                 <h2>"Outstanding"</h2>
-                <p class="tile-figure">
+                <p class="summary-figure">
                     <MoneyText cents=totals.outstanding_cents />
                 </p>
-            </article>
+            </div>
         </section>
     }
 }
@@ -2265,54 +2308,72 @@ fn empty_state(no_orders_at_all: bool, filter: Option<OrderStatus>) -> impl Into
 /// figures on the same DTO, not a rule the browser applies.
 fn order_table(orders: Vec<OrderSummary>) -> impl IntoView {
     view! {
-        <table class="order-table">
-            <thead>
-                <tr>
-                    <th scope="col">"Customer"</th>
-                    <th scope="col">"Due"</th>
-                    <th scope="col">"Status"</th>
-                    <th scope="col">"Items"</th>
-                    <th scope="col">"Total"</th>
-                    <th scope="col">"Paid"</th>
-                    <th scope="col">"Due now"</th>
-                </tr>
-            </thead>
-            <tbody>
-                {orders
-                    .into_iter()
-                    .map(|order| {
-                        let href = format!("/orders/{}", order.id);
-                        let due = order.due_date.to_string();
-                        let amount_due = order.amount_due_cents();
-                        view! {
-                            <tr>
-                                <td>
-                                    // The customer name is the link, so the
-                                    // target is named rather than being a bare
-                                    // "view" a screen reader reads out of
-                                    // context.
-                                    <A href=href>{order.customer}</A>
-                                </td>
-                                <td>{due}</td>
-                                <td>
-                                    <StatusBadge status=order.status.as_str() />
-                                </td>
-                                <td>{order.item_count}</td>
-                                <td>
-                                    <MoneyText cents=order.total_cents />
-                                </td>
-                                <td>
-                                    <MoneyText cents=order.paid_cents />
-                                </td>
-                                <td>
-                                    <MoneyText cents=amount_due />
-                                </td>
-                            </tr>
-                        }
-                    })
-                    .collect::<Vec<_>>()}
-            </tbody>
-        </table>
+        // Seven columns will not fit a phone at a size anybody can read, and
+        // dropping columns would drop money. The table scrolls inside this box
+        // instead, so the page itself never scrolls sideways.
+        <div class="table-scroll">
+            <table class="order-table">
+                <thead>
+                    <tr>
+                        <th scope="col">"Customer"</th>
+                        <th scope="col">"Due"</th>
+                        <th scope="col">"Status"</th>
+                        <th scope="col" class="num">
+                            "Items"
+                        </th>
+                        <th scope="col" class="num">
+                            "Total"
+                        </th>
+                        <th scope="col" class="num">
+                            "Paid"
+                        </th>
+                        <th scope="col" class="num">
+                            "Due now"
+                        </th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {orders
+                        .into_iter()
+                        .map(|order| {
+                            let href = format!("/orders/{}", order.id);
+                            let due = order.due_date.to_string();
+                            let amount_due = order.amount_due_cents();
+                            view! {
+                                // Read by the stylesheet, which rules an
+                                // overdue row down its leading edge. The badge
+                                // in the status column says the same thing in
+                                // words, so the rule adds a signal rather than
+                                // being the only one.
+                                <tr data-status=order.status.as_str()>
+                                    <td>
+                                        // The customer name is the link, so the
+                                        // target is named rather than being a
+                                        // bare "view" a screen reader reads out
+                                        // of context.
+                                        <A href=href>{order.customer}</A>
+                                    </td>
+                                    <td class="date">{due}</td>
+                                    <td>
+                                        <StatusBadge status=order.status.as_str() />
+                                    </td>
+                                    <td class="num">{order.item_count}</td>
+                                    <td class="num">
+                                        <MoneyText cents=order.total_cents />
+                                    </td>
+                                    <td class="num">
+                                        <MoneyText cents=order.paid_cents />
+                                    </td>
+                                    <td class="num">
+                                        <MoneyText cents=amount_due />
+                                    </td>
+                                </tr>
+                            }
+                        })
+                        .collect::<Vec<_>>()}
+                </tbody>
+            </table>
+        </div>
     }
 }
 
@@ -2393,45 +2454,57 @@ fn OrderDetailView(
     let maximum_cents = calculate_maximum_payment_cents(order.total_cents, order.paid_cents);
 
     view! {
-        <hgroup>
-            <h1>{order.customer.clone()}</h1>
-            <p>"Due " {order.due_date.to_string()}</p>
-        </hgroup>
-
-        <p>
+        // The status belongs in the heading block, not in a paragraph below it:
+        // it is a property of the record, and on its own line it read as the
+        // page's opening sentence.
+        <div class="record-header">
+            <div>
+                <h1>{order.customer.clone()}</h1>
+                <p class="record-meta">
+                    "Due " <span class="date">{order.due_date.to_string()}</span>
+                </p>
+            </div>
             <StatusBadge status=order.status.as_str() />
-        </p>
+        </div>
 
-        <table class="order-table">
-            <thead>
-                <tr>
-                    <th scope="col">"Description"</th>
-                    <th scope="col">"Quantity"</th>
-                    <th scope="col">"Unit price"</th>
-                    <th scope="col">"Line total"</th>
-                </tr>
-            </thead>
-            <tbody>
-                {order
-                    .items
-                    .iter()
-                    .map(|line| {
-                        view! {
-                            <tr>
-                                <td>{line.description.clone()}</td>
-                                <td>{line.quantity}</td>
-                                <td>
-                                    <MoneyText cents=line.unit_price_cents />
-                                </td>
-                                <td>
-                                    <MoneyText cents=line.line_total_cents />
-                                </td>
-                            </tr>
-                        }
-                    })
-                    .collect::<Vec<_>>()}
-            </tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="order-table">
+                <thead>
+                    <tr>
+                        <th scope="col">"Description"</th>
+                        <th scope="col" class="num">
+                            "Quantity"
+                        </th>
+                        <th scope="col" class="num">
+                            "Unit price"
+                        </th>
+                        <th scope="col" class="num">
+                            "Line total"
+                        </th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {order
+                        .items
+                        .iter()
+                        .map(|line| {
+                            view! {
+                                <tr>
+                                    <td>{line.description.clone()}</td>
+                                    <td class="num">{line.quantity}</td>
+                                    <td class="num">
+                                        <MoneyText cents=line.unit_price_cents />
+                                    </td>
+                                    <td class="num">
+                                        <MoneyText cents=line.line_total_cents />
+                                    </td>
+                                </tr>
+                            }
+                        })
+                        .collect::<Vec<_>>()}
+                </tbody>
+            </table>
+        </div>
 
         <dl class="totals">
             <dt>"Order total"</dt>

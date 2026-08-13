@@ -86,6 +86,11 @@ RUN mkdir -p src \
 COPY src ./src
 COPY style ./style
 COPY migrations ./migrations
+# The web fonts, which `assets-dir` in Cargo.toml tells cargo-leptos to copy
+# into target/site — the directory the runtime stage takes wholesale. Leave this
+# out and the image builds, starts, serves every page, and 404s three woff2
+# files, which shows up as an interface set in Helvetica and nothing in the log.
+COPY assets ./assets
 
 # `sqlx::migrate!` embeds ./migrations into the binary at compile time, so the
 # runtime image needs no copy of them and cannot drift from the code that

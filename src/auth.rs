@@ -785,11 +785,15 @@ pub fn AccountNav() -> impl IntoView {
                             Either::Left(
                                 view! {
                                     <li>
-                                        <small>{user.email}</small>
+                                        // Truncated with an ellipsis rather
+                                        // than wrapped: a long address would
+                                        // otherwise push "Sign out" onto a
+                                        // second line of the masthead.
+                                        <small class="account-email">{user.email}</small>
                                     </li>
                                     <li>
                                         <ActionForm action=auth.sign_out>
-                                            <button type="submit" class="outline secondary">
+                                            <button type="submit" class="secondary outline">
                                                 "Sign out"
                                             </button>
                                         </ActionForm>
@@ -881,7 +885,15 @@ pub fn AuthPage() -> impl IntoView {
                             required
                         />
                     </label>
-                    <button type="submit" disabled=move || auth.sign_up.pending().get()>
+                    // Secondary, so the page has one primary action. Both cards
+                    // filled would give equal weight to "sign in" and "sign
+                    // up", and almost everyone arriving here already has an
+                    // account.
+                    <button
+                        type="submit"
+                        class="secondary"
+                        disabled=move || auth.sign_up.pending().get()
+                    >
                         "Create account"
                     </button>
                     <ActionError value=Signal::derive(move || auth.sign_up.value().get()) />

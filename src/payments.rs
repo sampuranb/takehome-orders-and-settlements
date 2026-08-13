@@ -563,48 +563,53 @@ pub fn PaymentHistory(payments: Vec<PaymentRecord>, paid_cents: i64) -> impl Int
         <section class="payment-history">
             <h2>"Payments"</h2>
 
-            <table class="order-table">
-                <thead>
-                    <tr>
-                        <th scope="col">"Paid on"</th>
-                        <th scope="col">"Amount"</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {payments
-                        .into_iter()
-                        .map(|payment| {
-                            view! {
-                                <tr>
-                                    // ISO 8601, because `Display` on `NaiveDate`
-                                    // already produces it and `format()` needs
-                                    // chrono's `alloc`, which the browser build
-                                    // deliberately omits. The two would render
-                                    // the same string anyway.
-                                    <td>{payment.paid_on.to_string()}</td>
-                                    <td>
-                                        <MoneyText cents=payment.amount_cents />
-                                    </td>
-                                </tr>
-                            }
-                        })
-                        .collect::<Vec<_>>()}
-                </tbody>
-                <tfoot>
-                    <tr>
-                        <th scope="row">
-                            {if count == 1 {
-                                "1 payment".to_string()
-                            } else {
-                                format!("{count} payments")
-                            }}
-                        </th>
-                        <td>
-                            <MoneyText cents=paid_cents />
-                        </td>
-                    </tr>
-                </tfoot>
-            </table>
+            <div class="table-scroll">
+                <table class="order-table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Paid on"</th>
+                            <th scope="col" class="num">
+                                "Amount"
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {payments
+                            .into_iter()
+                            .map(|payment| {
+                                view! {
+                                    <tr>
+                                        // ISO 8601, because `Display` on
+                                        // `NaiveDate` already produces it and
+                                        // `format()` needs chrono's `alloc`,
+                                        // which the browser build deliberately
+                                        // omits. The two would render the same
+                                        // string anyway.
+                                        <td class="date">{payment.paid_on.to_string()}</td>
+                                        <td class="num">
+                                            <MoneyText cents=payment.amount_cents />
+                                        </td>
+                                    </tr>
+                                }
+                            })
+                            .collect::<Vec<_>>()}
+                    </tbody>
+                    <tfoot>
+                        <tr>
+                            <th scope="row">
+                                {if count == 1 {
+                                    "1 payment".to_string()
+                                } else {
+                                    format!("{count} payments")
+                                }}
+                            </th>
+                            <td class="num">
+                                <MoneyText cents=paid_cents />
+                            </td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
         </section>
         }
     })

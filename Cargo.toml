@@ -139,9 +139,12 @@ lib-profile-release = "wasm-release"
 # false, so that href is stable. This key is also what enables CSS hot reload:
 # cargo-leptos only watches a stylesheet declared as `style-file`.
 style-file = "style/main.css"
-# `assets-dir` is still intentionally absent: this application ships no static
-# files beyond the generated bundle, and cargo-leptos wipes anything in
-# site-root outside pkg/ on each rebuild.
+# Copied verbatim into site-root on every build, which is what makes
+# `/fonts/ibm-plex-*.woff2` resolvable — `file_and_error_handler` in main.rs
+# serves site-root, so the @font-face URLs in style/main.css point at real
+# files. cargo-leptos wipes site-root outside pkg/ on each rebuild and repopulates
+# it from here, so this directory is the only place those files may live.
+assets-dir = "assets"
 
 [profile.wasm-release]
 inherits = "release"
