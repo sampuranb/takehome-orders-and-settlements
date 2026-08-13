@@ -1,0 +1,12 @@
+{
+  "name": "orders-and-settlements-e2e",
+  "private": true,
+  "description": "Playwright end-to-end test. Scoped to tests/ so the Rust crate has no package.json at its root and no Node toolchain in its build context.",
+  "scripts": {
+    "test": "playwright test",
+    "install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
+}

@@ -1,0 +1,31 @@
+# Everything here is either secret, enormous, or would shadow the build the
+# Dockerfile is trying to do.
+
+# 15 GB of host build artifacts, compiled for the host's target. Copying them in
+# would both bloat the context and let a stale object file survive into a "fresh"
+# image.
+/target
+
+# Real credentials. `.env.example` is the file that ships.
+.env
+.env.local
+
+# The build does not need history, and .git carries every secret ever committed.
+.git
+.gitignore
+
+# Playwright's toolchain and output. The end-to-end test runs against a running
+# deployment from outside; nothing in it belongs in the image.
+node_modules
+tests/node_modules
+tests/test-results
+tests/playwright-report
+
+# Internal working notes, excluded from the repository and from the image.
+IMPLEMENTATION_PLAN.md
+
+.DS_Store
+*.log
+
+# Cargo.lock is deliberately *not* excluded: the build is reproducible only if
+# the image resolves the same dependency versions this was tested against.

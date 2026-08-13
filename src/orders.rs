@@ -679,6 +679,7 @@ pub mod ssr {
     use chrono::{NaiveDate, Utc};
     use leptos::prelude::use_context;
     use sqlx::{PgConnection, PgPool, QueryBuilder};
+    use std::sync::OnceLock;
     use uuid::Uuid;
 
     /// The date the overdue rule compares against.
@@ -744,17 +745,46 @@ pub mod ssr {
         line_total_cents: i64,
     }
 
+    /// The pool `main.rs` created at startup, registered here once so that it
+    /// can be found from anywhere in the process.
+    ///
+    /// Set by [`set_pool`] before the listener binds, and never replaced.
+    static PROCESS_POOL: OnceLock<PgPool> = OnceLock::new();
+
+    /// Records the process-wide pool. Called once, from `main`, before the
+    /// server starts accepting requests.
+    pub fn set_pool(pool: PgPool) {
+        // A second call would mean two pools in one process, which is the thing
+        // this module exists to prevent. Ignoring it keeps the first.
+        let _ = PROCESS_POOL.set(pool);
+    }
+
     /// The connection pool `main.rs` created at startup.
     ///
-    /// One pool per process, provided into context by
-    /// `leptos_routes_with_context`. A server function that built its own would
-    /// double the connection count against a database whose limit is the reason
+    /// One pool per process. A server function that built its own would double
+    /// the connection count against a database whose limit is the reason
     /// pooling exists.
+    ///
+    /// Context first, then the process pool. The fallback is not belt and
+    /// braces: Leptos builds parts of a page more than once while rendering a
+    /// response, and the extra pass does not always carry the request's
+    /// reactive context. Without a way to reach the pool from there, a
+    /// duplicated render of the dashboard failed with `INTERNAL` and Leptos
+    /// serialised that failure into the HTML next to the real answer — where
+    /// the browser could hydrate it instead. Both passes now return the same
+    /// thing, which is the property that matters. See `auth::Protected`.
+    ///
+    /// Cloning a `PgPool` clones a handle to the same pool, not a connection.
     pub fn pool() -> AppResult<PgPool> {
-        use_context::<PgPool>().ok_or_else(|| {
-            // Only reachable if the router stopped providing the pool, which is
-            // a wiring defect, not a user-visible condition.
-            tracing::error!("no database pool in context");
+        if let Some(pool) = use_context::<PgPool>() {
+            return Ok(pool);
+        }
+
+        PROCESS_POOL.get().cloned().ok_or_else(|| {
+            // Only reachable before `set_pool` has run, which cannot happen for
+            // a request: the listener binds after it. A wiring defect, then,
+            // not a user-visible condition.
+            tracing::error!("no database pool in context or in the process");
             AppError::Internal
         })
     }

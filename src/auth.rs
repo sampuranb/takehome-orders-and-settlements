@@ -452,6 +452,14 @@ pub mod ssr {
     /// them verbatim scopes them to this origin — which is exactly what makes a
     /// separately hosted auth service usable from here without CORS.
     pub fn append_set_cookie_headers(cookies: &[String]) {
+        // Nothing to emit is the ordinary case: the auth service only sends a
+        // cookie back when it rotates or clears one. Returning first means the
+        // error below is reported when a cookie is genuinely lost, rather than
+        // on every render that happens to run outside a response scope.
+        if cookies.is_empty() {
+            return;
+        }
+
         let Some(response) = use_context::<ResponseOptions>() else {
             tracing::error!("no ResponseOptions in scope; the session cookie was dropped");
             return;
@@ -698,6 +706,16 @@ pub fn expect_auth() -> AuthContext {
 /// `Transition` rather than `Suspense`: on a client-side navigation the identity
 /// is already known, and `Suspense` would blank the page back to its fallback
 /// while it revalidated.
+///
+/// Because `children` is a `ChildrenFn`, the gated page is *constructed* here,
+/// inside the suspense future — and Leptos may build that subtree more than
+/// once while rendering a response, in a scope that does not carry the
+/// request's reactive context. A page that creates a resource, like the
+/// dashboard, therefore creates two of them, and the extra one has to be able
+/// to answer correctly: see `orders::ssr::pool`, which is why the connection
+/// pool is reachable without context. Rendering the same data twice is waste;
+/// serialising an error from the second render into the page, which is what
+/// happened before that, was a defect the browser could hydrate.
 #[component]
 pub fn Protected(children: ChildrenFn) -> impl IntoView {
     use leptos::either::Either;

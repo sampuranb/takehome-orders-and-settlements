@@ -6,10 +6,11 @@
 .env
 .env.local
 
-# Playwright / end-to-end tooling arrives in Feature 10.
+# Playwright. The spec and its package.json are committed; the toolchain it
+# downloads and the artifacts it writes are not.
 node_modules
-/end2end/test-results
-/end2end/playwright-report
+/tests/test-results
+/tests/playwright-report
 
 *.log
 .DS_Store

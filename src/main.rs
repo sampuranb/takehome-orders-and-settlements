@@ -30,7 +30,9 @@ use leptos::prelude::{get_configuration, provide_context, LeptosOptions};
 #[cfg(feature = "ssr")]
 use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
 #[cfg(feature = "ssr")]
-use orders_and_settlements::{error::AppError, orders::api as orders_api, shell, App};
+use orders_and_settlements::{
+    error::AppError, orders::api as orders_api, orders::ssr as orders_ssr, shell, App,
+};
 #[cfg(feature = "ssr")]
 use serde::Serialize;
 #[cfg(feature = "ssr")]
@@ -149,6 +151,12 @@ async fn start() -> Result<(), StartupError> {
     let config = load_config()?;
     let pool = create_pool(&config.database_url).await?;
     run_migrations(&pool).await?;
+
+    // Registered before anything can serve a request. The router still provides
+    // the pool through context, which is what a request normally reads; this is
+    // for the render passes Leptos runs outside that context. See
+    // `orders::ssr::pool`.
+    orders_ssr::set_pool(pool.clone());
 
     let leptos_options = get_configuration(None)
         .map_err(|error| StartupError::LeptosConfig(error.to_string()))?

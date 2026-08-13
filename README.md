@@ -69,6 +69,89 @@ two are different origins to both the browser and Better Auth, and the shared
 auth service only trusts `http://localhost:5174`. Signing out from any other
 origin is refused with `403`.
 
+## Running in Docker
+
+The application and its PostgreSQL come up together. The build is a single
+`docker build` — no Node toolchain, no npm install, nothing to install on the
+host but Docker itself.
+
+```bash
+docker compose up --build
+```
+
+Then browse to **<http://localhost:5174>**, the same address and for the same
+reason as above.
+
+`compose.yaml` deliberately does **not** run a copy of the shared Better Auth
+service. That service is a separate deployment with its own database and its own
+secret; a second copy would mean two user tables and two session stores, and an
+account created against one could not sign in to the other. The container's
+`BETTER_AUTH_URL` defaults to `http://host.docker.internal:3005`, which is the
+auth service running on the developer's own machine; point it anywhere else with
+
+```bash
+AUTH_SERVICE_URL=https://auth.example.com docker compose up --build
+```
+
+The override is spelled `AUTH_SERVICE_URL` rather than `BETTER_AUTH_URL`
+because compose substitutes `${...}` from `./.env` — the local *development*
+file, where `BETTER_AUTH_URL` is `http://localhost:3005`, an address that inside
+a container means the container itself. Sharing the name would quietly pull that
+value in and fail every sign-in with `503`.
+
+The image is built in two stages. The builder is `rust:1.97-slim-bookworm` and
+installs `cargo-leptos` at a pinned version; the runtime is
+`debian:bookworm-slim` and carries the binary, `target/site`, and
+`ca-certificates` — nothing else. There is no shell tooling in it on purpose:
+the TLS stack is rustls, so there is no OpenSSL to keep patched, and the
+certificates are only there because outbound HTTPS to the auth service needs a
+trust store to verify against.
+
+Dependencies are compiled in their own layer from `Cargo.toml` and `Cargo.lock`
+alone, so editing application source rebuilds only the application. `Cargo.lock`
+is committed and the build is `--locked`: the image that ships is built from the
+same dependency versions the tests ran against.
+
+It runs as an unprivileged user (`uid 10001`), listens on `8080`, and reads
+every setting from the environment.
+
+There is no `HEALTHCHECK` in the image, and no healthcheck on the `app` service.
+A container-side check has to run *inside* the runtime image, which has no curl,
+no wget, and a `/bin/sh` that is dash and so has no `/dev/tcp` — every one-liner
+that looks like it would work there reports unhealthy instead. `/health` still
+exists and still answers `503` when PostgreSQL is unreachable; point the
+platform's own probe at it, which is where a health check that means anything
+runs from anyway:
+
+```bash
+curl -fsS http://localhost:5174/health
+```
+
+## Deploying
+
+The image is self-contained and takes its configuration from the environment, so
+any platform that runs a container will run it: set `DATABASE_URL`,
+`BETTER_AUTH_URL` and `LEPTOS_SITE_ADDR`, expose the port, and point the
+health probe at `/health`.
+
+Two things have to be true of wherever it lands:
+
+- **The browser origin must be one Better Auth trusts.** Sessions are issued by
+  the shared auth service and it refuses requests from origins it does not know,
+  so the deployed hostname has to be added to its trusted origins — otherwise
+  sign-in appears to work and sign-out returns `403`.
+- **`BETTER_AUTH_URL` only has to be reachable from the server**, never from the
+  browser. This application calls the auth service itself and re-emits the
+  session cookie on its own origin, so the auth service can stay on a private
+  network.
+
+**No live URL is deployed.** Standing up a public deployment requires creating a
+hosting account and, on every provider that would keep the app awake for a
+grader, entering payment details — both actions I do not take on someone's
+behalf. The container is the deliverable I can produce and verify; the account
+is yours to create. `docker compose up --build` reproduces the whole thing
+locally in one command.
+
 ## Configuration
 
 | Variable | Required | Purpose |
@@ -417,6 +500,52 @@ cargo test --features ssr --no-default-features
 cargo leptos build
 ```
 
+One end-to-end test runs in a real browser, against a running deployment:
+
+```bash
+cd tests
+npm install
+npx playwright install chromium
+BASE_URL=http://localhost:5174 npx playwright test
+```
+
+`tests/order-lifecycle.spec.ts` is a single spec on purpose. The Rust suite
+already covers the rules exhaustively and far faster; what it cannot cover is
+the half of this application that only exists in a browser — that the
+server-rendered HTML hydrates, that a form submission reaches a server function
+and comes back, that the page updates without a reload, and that a session
+issued by a separate service is accepted here. A second spec re-asserting
+business rules would be a slow copy of tests that already pass.
+
+It is black box throughout: no database access, no test hooks, nothing this
+application would not do for a person with a browser. It signs up a brand new
+account each run, so runs never interfere and no cleanup step exists. Then it
+creates a $1,000 order, pays $400 and watches the badge, the totals and the
+payment history change in place at the same URL, is refused $700 with "The most
+you can pay is $600.00.", settles it with $600, reads the dashboard and its
+`?status=` filters as fresh navigations — which asserts what the *server*
+rendered, before hydration — signs out, signs up again, and asks for the first
+account's order by its exact address, which is the check a filtered list cannot
+make.
+
+The one piece of machinery in it is a hydration wait, and it is correctness
+rather than politeness: Leptos re-binds every input to its signal when the
+bundle takes over, so a value typed before that point is wiped the instant it
+does. The test re-fills the field on a poll until a reactive value — a line
+total computed in the browser by the same Rust code the server uses — proves the
+page is live.
+
+It earned its place on the first run, by failing. Leptos builds a gated page's
+subtree more than once while rendering a response, and the extra pass does not
+carry the request's reactive context, so the dashboard's server function ran a
+second time, found no connection pool, and Leptos serialised that `INTERNAL`
+error into the HTML beside the correct answer — which the browser could then
+hydrate instead of the good one, on roughly one page load in six. Every Rust
+test passed throughout: the two renders, the serialised payload and the
+hydration that chooses between them exist only in a browser. The fix is in
+`orders::ssr::pool`, which now finds the pool whether or not it is called inside
+a request context, so both passes return the same thing.
+
 `tests/api.rs` drives the real router in process through `tower`'s `oneshot`,
 with `wiremock` standing in for Better Auth — one mocked session cookie per
 test, each resolving to its own owner id so the tests stay parallel-safe. It
@@ -500,9 +629,14 @@ Implemented:
 - One authoritative detail view: items, payment history, totals, and actions
 - Dashboard: totals across every order, and a shareable URL-driven status filter
 - A REST API over the same services, with a documented status and error contract
+- A container image and a one-command compose stack for the app and its database
+- An end-to-end browser test walking the whole lifecycle against a running build
 
 Not yet implemented:
-- Deployment and the deployed URL
+
+- A live public URL. The container is built and verified; standing one up needs
+  a hosting account and payment details, which are the user's to create. See
+  [Deploying](#deploying).
 
 ## License
 
