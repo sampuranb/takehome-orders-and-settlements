@@ -103,14 +103,124 @@ cannot serve.
 | `POST` | `/api/list_orders*` | Server function: the caller's orders with derived status, totals, and an optional status filter |
 | `POST` | `/api/get_order*` | Server function: one order with its line items |
 | `POST` | `/api/record_payment*` | Server function: record a payment against an order (JSON body) |
+| `GET` | `/api/orders` | REST: the caller's orders, with totals and an optional `?status=` filter |
+| `POST` | `/api/orders` | REST: create an order |
+| `GET` | `/api/orders/{id}` | REST: one order with its items and payments |
+| `PUT` | `/api/orders/{id}` | REST: replace an order's customer, date, and items |
+| `DELETE` | `/api/orders/{id}` | REST: delete an order and its line items |
+| `POST` | `/api/orders/{id}/payments` | REST: record a payment against an order |
 | `GET` | `/pkg/*` | Hydration bundle and stylesheet |
 
 Application pages are server-rendered and then hydrated. Unmatched paths return
 `404` with the same shell. `/auth` is the only public page; everything else is
-gated. The REST API for orders and payments arrives with a later feature.
+gated.
 
-Server-function paths carry a generated suffix, so the exact URLs are read from
-the rendered `<form action>` rather than hard-coded.
+Server-function paths carry a generated suffix — `/api/sign_in9451780611962502888`
+— so the exact URLs are read from the rendered `<form action>` rather than
+hard-coded. That suffix is also why the hand-written `/api/orders` routes cannot
+collide with them.
+
+## REST API
+
+A second surface over the same services, not a second implementation. Every
+handler is four steps — authenticate, check the origin, call the service the
+Leptos server function also calls, shape a response — and contains no SQL, no
+validation, and no business rule of its own. A rule that lived in a handler
+would be a rule the web UI does not enforce.
+
+The route table is `orders::api::router()`, in the library rather than in
+`main.rs`, so `tests/api.rs` mounts the same paths and methods that are served.
+A test with its own route table would pass while the deployed URL was
+`/api/order`.
+
+### Authentication and CSRF
+
+Requests carry the same session cookie the pages use, so the API is usable from
+the browser that is already signed in. A missing or expired session is `401`.
+
+State-changing requests are refused if they carry an `Origin` header that is not
+this application's own. An **absent** `Origin` is allowed, which is deliberately
+weaker than the rule the server functions apply: a browser cannot suppress
+`Origin` on a cross-site state-changing request, so its absence means the caller
+is not a page — `curl`, a script, a mobile client. Refusing those would make the
+REST surface unusable by everything except the site that already has a UI, while
+present-and-wrong, the case that actually matters, is still refused.
+
+### Status codes
+
+| Code | When |
+| --- | --- |
+| `200` | A read, or a successful replace |
+| `201` | A created order or payment, with `Location` pointing at the order |
+| `204` | A successful delete — nothing left to describe |
+| `400` | Validation failed, a malformed body, or an unparseable id |
+| `401` | No session, or an expired one |
+| `403` | A state-changing request from another origin |
+| `404` | No such order — **or** somebody else's |
+| `409` | The order's own state refuses: it has payments, or the payment exceeds the balance |
+| `500` | A defect here |
+| `503` | PostgreSQL is unreachable |
+
+`404` for another owner's order is the point, not an accident. A distinct `403`
+would confirm that an order with that id exists, which is the fact an
+unauthorised caller is probing for.
+
+`409` rather than `400` for overpayment and for editing a settled order: the
+request is well formed and the caller is entitled to make it. The order's state
+is what refuses, and the same request could succeed at another moment.
+
+### Errors
+
+Every failure has one shape:
+
+```json
+{
+  "error": "VALIDATION_FAILED",
+  "message": "Some details need fixing.",
+  "fields": [{ "field": "items[0].quantity", "message": "Enter a whole number of at least 1." }]
+}
+```
+
+`error` is a stable code to branch on, `message` is the sentence a person is
+shown, and `fields` — present only when the failure is about specific inputs —
+carries the same machine-readable paths the browser matches on, so a non-browser
+client can put each message next to the right input too. A malformed JSON body
+is reported in this shape as well rather than in Axum's plain text, so a client
+has one error format to parse.
+
+### Bodies
+
+`POST` and `PUT /api/orders/{id}` take the same document, and `PUT` is a
+replace rather than a patch: the items sent are the items the order ends up
+with. A partial update of a list of line items has no obvious meaning — there is
+no stable client-visible identity to patch against — and inventing one would be
+a rule this API has and the web form does not.
+
+```json
+{
+  "customer": "Acme Corp",
+  "due_date": "2027-03-31",
+  "items": [{ "description": "Consulting", "quantity": "2", "unit_price": "500.00" }]
+}
+```
+
+Money and quantities are sent as **strings** and parsed on the server, by the
+same parser the form uses. `"$1,234.50"` is accepted; a float is never involved.
+
+A create responds with the order as it was stored — the server's own id, totals,
+and derived status — rather than an echo of what was sent.
+
+`POST /api/orders/{id}/payments` takes `{"amount": "400.00", "paid_on":
+"2026-08-13"}` and responds with the **whole order**, not the payment row.
+Recording money changes the amount due, the derived status, and whether the
+order can still be edited; returning only a receipt would leave a client holding
+a stale order, and the obvious next thing it would do is compute the new balance
+itself.
+
+`GET /api/orders` returns the same document the dashboard renders — `totals`,
+the `filter` that was actually applied, and `orders` — so a client's figures are
+the page's figures. An unrecognised `?status=` is no filter rather than a `400`,
+and the `filter` field says so.
 
 ## Authentication
 
@@ -307,6 +417,13 @@ cargo test --features ssr --no-default-features
 cargo leptos build
 ```
 
+`tests/api.rs` drives the real router in process through `tower`'s `oneshot`,
+with `wiremock` standing in for Better Auth — one mocked session cookie per
+test, each resolving to its own owner id so the tests stay parallel-safe. It
+asserts what only that layer can get wrong: routes, methods, status codes, the
+error shape, and `404` for another owner's order. The business rules themselves
+stay covered against the services directly, rather than being asserted twice.
+
 `DATABASE_URL` must be set, and the database must be running: `tests/orders.rs`
 exercises real PostgreSQL behaviour — the `CHECK` constraints, the cascade, and
 the all-or-nothing write — and a fake would only re-assert what the test file
@@ -382,10 +499,9 @@ Implemented:
 - Orders locked against edit and delete once money is recorded against them
 - One authoritative detail view: items, payment history, totals, and actions
 - Dashboard: totals across every order, and a shareable URL-driven status filter
+- A REST API over the same services, with a documented status and error contract
 
 Not yet implemented:
-
-- REST API
 - Deployment and the deployed URL
 
 ## License

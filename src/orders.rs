@@ -1172,6 +1172,303 @@ pub mod ssr {
 }
 
 // ---------------------------------------------------------------------------
+// REST API
+//
+// A second surface over the *same* services, not a second implementation. Every
+// handler below is four steps — authenticate, check the origin, call the
+// service that the Leptos server function also calls, shape a response — and
+// contains no SQL, no validation, and no business rule of its own. A rule that
+// existed here would be a rule the web UI does not enforce.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ssr")]
+pub mod api {
+    use axum::extract::rejection::JsonRejection;
+    use axum::extract::{FromRef, Path, Query, State};
+    use axum::http::header::{LOCATION, ORIGIN, SET_COOKIE};
+    use axum::http::{request::Parts, HeaderValue, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use serde::{Deserialize, Serialize};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::ssr::{
+        create_order_service, delete_order_service, find_order_for_user, list_orders_for_user,
+        update_order_service,
+    };
+    use super::{filter_by_status, summarise_orders, Dashboard, NewOrderInput, OrderStatus};
+    use crate::auth::ssr::authenticate;
+    use crate::auth::AuthUser;
+    use crate::error::{AppError, AppResult, FieldError};
+
+    /// The `/api` route table, mounted by `main.rs` and by `tests/api.rs`.
+    ///
+    /// Generic over the router's state so the binary can mount it on its own
+    /// `AppState` while the contract tests mount it on a bare `PgPool`. Both
+    /// exercise the same paths and the same methods: a test that declared its
+    /// own route table would pass while the deployed URL was `/api/order`.
+    ///
+    /// Axum 0.8 path parameters are `{id}`, not the `:id` of 0.7 and earlier —
+    /// the old syntax now panics when the router is built rather than quietly
+    /// failing to match.
+    ///
+    /// A method that a path does not implement answers `405 Method Not
+    /// Allowed` automatically, because the methods are registered on one route
+    /// rather than as separate routes that would shadow one another.
+    pub fn router<S>() -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+        PgPool: FromRef<S>,
+    {
+        Router::new()
+            .route("/api/orders", get(list_orders).post(create_order))
+            .route(
+                "/api/orders/{id}",
+                get(get_order).put(update_order).delete(delete_order),
+            )
+            .route(
+                "/api/orders/{id}/payments",
+                post(crate::payments::api::record_payment),
+            )
+    }
+
+    /// `?status=` on the order list.
+    #[derive(Debug, Deserialize)]
+    pub struct StatusQuery {
+        status: Option<String>,
+    }
+
+    /// The caller, and any cookie Better Auth rotated while confirming them.
+    ///
+    /// [`AppError::Unauthenticated`] renders as `401`, which is the answer a
+    /// missing or expired session deserves. The Leptos pages get the same
+    /// answer from `require_user`; this is the same check without the reactive
+    /// context that a bare Axum handler does not have.
+    pub(crate) async fn caller(parts: &Parts) -> AppResult<(AuthUser, Vec<String>)> {
+        let checked = authenticate(parts).await?;
+
+        match checked.user {
+            Some(user) => Ok((user, checked.set_cookies)),
+            None => Err(AppError::Unauthenticated),
+        }
+    }
+
+    /// Refuses a state-changing request that a *browser* sent from elsewhere.
+    ///
+    /// Deliberately weaker than the server-function rule, which demands a
+    /// matching `Origin` outright. This API is authenticated by a cookie, so
+    /// the attack to stop is a page on another origin making the browser send
+    /// this one a request with the session attached — and a browser cannot
+    /// suppress `Origin` on a cross-site state-changing request. An absent
+    /// `Origin` therefore means the request did not come from a page at all:
+    /// `curl`, a script, a mobile client. Refusing those would make the REST
+    /// surface unusable by everything except the site that already has a UI.
+    ///
+    /// Present-and-wrong is still refused, which is the case that matters.
+    pub(crate) fn guard_origin(parts: &Parts) -> AppResult<()> {
+        if parts.headers.contains_key(ORIGIN) {
+            crate::auth::ssr::ensure_same_origin(parts)?;
+        }
+
+        Ok(())
+    }
+
+    /// Parses a path id, or reports which field was wrong.
+    ///
+    /// `400` rather than `404`: the id is the caller's own input and its syntax
+    /// is something they can see is wrong, so saying so leaks nothing about
+    /// whose orders exist. A well-formed id that is not the caller's is the
+    /// case that must be indistinguishable from missing, and that answer comes
+    /// from the query, not from here.
+    pub(crate) fn parse_id(raw: &str) -> AppResult<Uuid> {
+        Uuid::parse_str(raw).map_err(|_| {
+            AppError::ValidationFailed(vec![FieldError {
+                field: "id".to_string(),
+                message: "That is not a valid order id.".to_string(),
+            }])
+        })
+    }
+
+    /// Turns a rejected body into the same field-error shape every other
+    /// failure uses, so a client has one error format to parse rather than
+    /// Axum's plain text for malformed JSON and this application's JSON for
+    /// everything else.
+    pub(crate) fn body<T>(result: Result<Json<T>, JsonRejection>) -> AppResult<T> {
+        result.map(|Json(value)| value).map_err(|rejection| {
+            AppError::ValidationFailed(vec![FieldError {
+                field: "body".to_string(),
+                // Serde's own message: which key, and what was expected there.
+                message: rejection.body_text(),
+            }])
+        })
+    }
+
+    /// Attaches any rotated session cookie to a finished response.
+    ///
+    /// One header per cookie, never joined — `Set-Cookie` cannot be
+    /// comma-folded. Silence on an unencodable value would be worse than a log
+    /// line, but the value is a session token, so only the failure is logged.
+    pub(crate) fn with_cookies(mut response: Response, cookies: Vec<String>) -> Response {
+        for cookie in cookies {
+            match HeaderValue::from_str(&cookie) {
+                Ok(value) => {
+                    response.headers_mut().append(SET_COOKIE, value);
+                }
+                Err(_) => tracing::error!("auth service sent an unencodable Set-Cookie header"),
+            }
+        }
+
+        response
+    }
+
+    pub(crate) fn ok<T: Serialize>(value: T, cookies: Vec<String>) -> Response {
+        with_cookies(Json(value).into_response(), cookies)
+    }
+
+    /// `201` with a `Location`, which is what makes a create discoverable: the
+    /// client is told where the thing it made now lives, not only what it is.
+    pub(crate) fn created<T: Serialize>(
+        location: &str,
+        value: T,
+        cookies: Vec<String>,
+    ) -> Response {
+        let mut response = (StatusCode::CREATED, Json(value)).into_response();
+
+        match HeaderValue::from_str(location) {
+            Ok(value) => {
+                response.headers_mut().insert(LOCATION, value);
+            }
+            // A UUID path is always a valid header value; this arm is
+            // unreachable and is here so a future change cannot make it silent.
+            Err(_) => tracing::error!(%location, "could not encode a Location header"),
+        }
+
+        with_cookies(response, cookies)
+    }
+
+    /// `GET /api/orders` — the caller's orders, with totals and an optional
+    /// `?status=` filter.
+    ///
+    /// Returns the same [`Dashboard`] document the web dashboard renders. One
+    /// shape for both surfaces means the totals a client reports are the totals
+    /// the page shows, and there is no second DTO to keep in step.
+    ///
+    /// An unrecognised `?status=` is no filter rather than a `400`, exactly as
+    /// in the UI: the request is still answerable, and the `filter` field in
+    /// the response says which filter was actually applied.
+    async fn list_orders(
+        State(pool): State<PgPool>,
+        parts: Parts,
+        Query(query): Query<StatusQuery>,
+    ) -> AppResult<Response> {
+        let (user, cookies) = caller(&parts).await?;
+
+        let filter = query.status.as_deref().and_then(OrderStatus::parse);
+        let all = list_orders_for_user(&pool, &user.id).await?;
+        let totals = summarise_orders(&all);
+
+        Ok(ok(
+            Dashboard {
+                totals,
+                filter,
+                orders: filter_by_status(all, filter),
+            },
+            cookies,
+        ))
+    }
+
+    /// `POST /api/orders` — creates an order and returns it as it was stored.
+    ///
+    /// The response is a re-read rather than an echo of the request, so what
+    /// the client gets back carries the server's own totals, status, and id
+    /// instead of the strings it sent.
+    async fn create_order(
+        State(pool): State<PgPool>,
+        parts: Parts,
+        input: Result<Json<NewOrderInput>, JsonRejection>,
+    ) -> AppResult<Response> {
+        let (user, cookies) = caller(&parts).await?;
+        guard_origin(&parts)?;
+        let input = body(input)?;
+
+        let order_id = create_order_service(&pool, &user.id, &input).await?;
+        let order = find_order_for_user(&pool, &user.id, order_id).await?;
+
+        Ok(created(&format!("/api/orders/{order_id}"), order, cookies))
+    }
+
+    /// `GET /api/orders/{id}` — one order with its items and payments.
+    ///
+    /// `404` both for an id that does not exist and for one belonging to
+    /// somebody else. The two are the same answer on purpose: a distinct `403`
+    /// would confirm that an order with that id exists, which is exactly the
+    /// fact an unauthorised caller is probing for.
+    async fn get_order(
+        State(pool): State<PgPool>,
+        parts: Parts,
+        Path(id): Path<String>,
+    ) -> AppResult<Response> {
+        let (user, cookies) = caller(&parts).await?;
+        let order_id = parse_id(&id)?;
+
+        let order = find_order_for_user(&pool, &user.id, order_id).await?;
+
+        Ok(ok(order, cookies))
+    }
+
+    /// `PUT /api/orders/{id}` — replaces an order's customer, date, and items.
+    ///
+    /// A replace, not a patch: the body is the same document `POST` takes, and
+    /// the line items sent are the line items the order ends up with. A partial
+    /// update of a list of items has no obvious meaning — there is no stable
+    /// client-visible identity for a line to patch against — and inventing one
+    /// would be a rule this API has and the web form does not.
+    ///
+    /// `409` once a payment exists against the order, because the total the
+    /// money was measured against must not move under it.
+    async fn update_order(
+        State(pool): State<PgPool>,
+        parts: Parts,
+        Path(id): Path<String>,
+        input: Result<Json<NewOrderInput>, JsonRejection>,
+    ) -> AppResult<Response> {
+        let (user, cookies) = caller(&parts).await?;
+        guard_origin(&parts)?;
+        let order_id = parse_id(&id)?;
+        let input = body(input)?;
+
+        update_order_service(&pool, &user.id, order_id, &input).await?;
+        let order = find_order_for_user(&pool, &user.id, order_id).await?;
+
+        Ok(ok(order, cookies))
+    }
+
+    /// `DELETE /api/orders/{id}` — removes an order and its line items.
+    ///
+    /// `204` with no body, because there is nothing left to describe. Deleting
+    /// an order that is already gone is a `404`, not a success: the caller
+    /// asked about a specific row, and pretending is not an answer.
+    async fn delete_order(
+        State(pool): State<PgPool>,
+        parts: Parts,
+        Path(id): Path<String>,
+    ) -> AppResult<Response> {
+        let (user, cookies) = caller(&parts).await?;
+        guard_origin(&parts)?;
+        let order_id = parse_id(&id)?;
+
+        delete_order_service(&pool, &user.id, order_id).await?;
+
+        Ok(with_cookies(
+            StatusCode::NO_CONTENT.into_response(),
+            cookies,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server functions
 // ---------------------------------------------------------------------------
 

@@ -324,6 +324,61 @@ pub mod ssr {
 }
 
 // ---------------------------------------------------------------------------
+// REST API
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ssr")]
+pub mod api {
+    use axum::extract::rejection::JsonRejection;
+    use axum::extract::{Path, State};
+    use axum::http::request::Parts;
+    use axum::response::Response;
+    use axum::Json;
+    use sqlx::PgPool;
+
+    use super::ssr::record_payment_service;
+    use super::NewPaymentInput;
+    use crate::error::AppResult;
+    use crate::orders::api::{body, caller, created, guard_origin, parse_id};
+    use crate::orders::ssr::find_order_for_user;
+
+    /// `POST /api/orders/{id}/payments` — records a payment against an order.
+    ///
+    /// A payment is a sub-resource of the order, and the URL says so: there is
+    /// no `/api/payments`, because a payment has no meaning without the order
+    /// whose balance it is measured against, and a top-level collection would
+    /// invite a body carrying its own `order_id` — a second place for the two
+    /// to disagree.
+    ///
+    /// The response is the **whole order**, not the payment row. Recording
+    /// money changes the amount due, the derived status, and whether the order
+    /// can still be edited; returning only the payment would leave a client
+    /// holding a receipt and a stale order, and the obvious next thing it would
+    /// do is compute the new balance itself. `Location` still points at the
+    /// order, since that is where the payment is now visible.
+    ///
+    /// Overpayment is refused by the service inside its transaction and comes
+    /// back as `409` with the maximum that could be paid, so a client that
+    /// raced another client is told what to do rather than only that it failed.
+    pub async fn record_payment(
+        State(pool): State<PgPool>,
+        parts: Parts,
+        Path(id): Path<String>,
+        input: Result<Json<NewPaymentInput>, JsonRejection>,
+    ) -> AppResult<Response> {
+        let (user, cookies) = caller(&parts).await?;
+        guard_origin(&parts)?;
+        let order_id = parse_id(&id)?;
+        let input = body(input)?;
+
+        record_payment_service(&pool, &user.id, order_id, &input).await?;
+        let order = find_order_for_user(&pool, &user.id, order_id).await?;
+
+        Ok(created(&format!("/api/orders/{order_id}"), order, cookies))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server functions
 // ---------------------------------------------------------------------------
 

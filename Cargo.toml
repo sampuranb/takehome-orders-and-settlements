@@ -88,7 +88,11 @@ console_error_panic_hook = { version = "0.1", optional = true }
 # without running Node, including failure modes a live service will not produce
 # on demand (outage, malformed body, refreshed cookie).
 wiremock = "0.6.5"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync"] }
+# `ServiceExt::oneshot`, so `tests/api.rs` can drive the real router in-process
+# instead of binding a port. Already in the lock file as a transitive dependency
+# of Axum, but a crate is not nameable until it is a direct one.
+tower = { version = "0.5.3", features = ["util"] }
 
 [features]
 default = []

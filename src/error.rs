@@ -265,10 +265,19 @@ pub type AppResult<T> = Result<T, AppError>;
 ///
 /// Serialize only: `error` borrows a `&'static str` from [`AppError::code`],
 /// which serde cannot deserialize into. Tests read the body as JSON.
+///
+/// Three fields, each for a different reader. `error` is the stable code a
+/// client branches on; `message` is the sentence a person is shown; `fields`
+/// is what a form needs to put a message next to the input that caused it.
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: &'static str,
     pub message: String,
+    /// Omitted entirely rather than sent as `[]`, so a client can treat its
+    /// presence as "this failure is about specific inputs" without inspecting
+    /// the length. Only [`AppError::ValidationFailed`] ever fills it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<FieldError>,
 }
 
 impl From<&AppError> for ErrorBody {
@@ -276,6 +285,12 @@ impl From<&AppError> for ErrorBody {
         Self {
             error: error.code(),
             message: error.to_string(),
+            // Cloned rather than borrowed: this body outlives the error it
+            // describes, and a REST client that is only told "validation
+            // failed" has to guess which of six inputs to fix. The browser
+            // gets these through the server-function encoding; sending them
+            // here is what makes the two surfaces report the same failure.
+            fields: error.field_errors().to_vec(),
         }
     }
 }

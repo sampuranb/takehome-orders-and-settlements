@@ -466,6 +466,45 @@ pub mod ssr {
         }
     }
 
+    /// Who a request is from, and any cookie the auth service rotated while
+    /// answering.
+    ///
+    /// The cookies are returned rather than emitted because the two callers
+    /// emit them differently: a server function has `ResponseOptions` in
+    /// context, and a REST handler has a `Response` in hand.
+    #[derive(Debug)]
+    pub struct SessionCheck {
+        pub user: Option<AuthUser>,
+        pub set_cookies: Vec<String>,
+    }
+
+    /// Validates the session on a request, given its parts.
+    ///
+    /// The only part of authentication that both the Leptos and the REST
+    /// surfaces run. It is a plain function of [`Parts`] — it reads no
+    /// context and writes no response — which is what makes it callable from a
+    /// bare Axum handler, where Leptos's reactive owner does not exist.
+    ///
+    /// That distinction is not cosmetic. [`incoming_parts`] resolves the
+    /// request through `use_context`, and a REST handler mounted directly on
+    /// the router has no context to resolve it from: every call would return
+    /// `Internal` and report a missing session as `500` instead of `401`.
+    pub async fn authenticate(parts: &Parts) -> AppResult<SessionCheck> {
+        let Some(cookie) = incoming_cookie(parts) else {
+            return Ok(SessionCheck {
+                user: None,
+                set_cookies: Vec::new(),
+            });
+        };
+
+        let reply = AuthClient::from_env()?.get_session(cookie).await?;
+
+        Ok(SessionCheck {
+            user: reply.value,
+            set_cookies: reply.cookies,
+        })
+    }
+
     /// Resolves the caller's identity, or `None` if they are not signed in.
     ///
     /// Returns `Ok(None)` rather than an error when there is no request in
@@ -476,16 +515,12 @@ pub mod ssr {
             return Ok(None);
         };
 
-        let Some(cookie) = incoming_cookie(&parts) else {
-            return Ok(None);
-        };
-
-        let reply = AuthClient::from_env()?.get_session(cookie).await?;
+        let checked = authenticate(&parts).await?;
         // Usually empty. When it is not, Better Auth has rotated the session
         // cookie and this is the only chance to hand the new one to the browser.
-        append_set_cookie_headers(&reply.cookies);
+        append_set_cookie_headers(&checked.set_cookies);
 
-        Ok(reply.value)
+        Ok(checked.user)
     }
 
     /// The authorization gate every protected server function calls first.

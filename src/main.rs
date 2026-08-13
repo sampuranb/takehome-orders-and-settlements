@@ -30,7 +30,7 @@ use leptos::prelude::{get_configuration, provide_context, LeptosOptions};
 #[cfg(feature = "ssr")]
 use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
 #[cfg(feature = "ssr")]
-use orders_and_settlements::{error::AppError, shell, App};
+use orders_and_settlements::{error::AppError, orders::api as orders_api, shell, App};
 #[cfg(feature = "ssr")]
 use serde::Serialize;
 #[cfg(feature = "ssr")]
@@ -67,6 +67,19 @@ pub struct AppState {
 impl FromRef<AppState> for LeptosOptions {
     fn from_ref(state: &AppState) -> Self {
         state.leptos_options.clone()
+    }
+}
+
+/// Lets the REST handlers extract `State<PgPool>` from this state.
+///
+/// The handlers live in the library crate, which cannot name `AppState` — it is
+/// defined in this binary. Projecting the one field they need keeps them
+/// mountable on any router, including the bare `PgPool` router that
+/// `tests/api.rs` builds. Cloning a `PgPool` clones a handle, not a connection.
+#[cfg(feature = "ssr")]
+impl FromRef<AppState> for PgPool {
+    fn from_ref(state: &AppState) -> Self {
+        state.pool.clone()
     }
 }
 
@@ -234,6 +247,14 @@ fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        // The REST contract. Mounted before the Leptos routes for readability
+        // only: Axum matches on a trie, not in registration order, and these
+        // literal paths cannot collide with the generated server-function
+        // endpoints, which carry a hash suffix (`/api/create_order<hash>`).
+        //
+        // The same function is what `tests/api.rs` mounts, so the paths under
+        // test are the paths served.
+        .merge(orders_api::router())
         // Registers the discovered SSR routes *and*, automatically, every
         // `#[server]` function endpoint (integrations/axum/src/lib.rs:1826),
         // providing the context closure to both.
