@@ -18,7 +18,7 @@ use leptos_router::components::{Outlet, ParentRoute, Route, Router, Routes, A};
 use leptos_router::path;
 
 use crate::auth::{provide_auth, AccountNav, AuthPage, Protected};
-use crate::orders::{EditOrderPage, OrderDetailPage, OrderEditor, OrdersPage};
+use crate::orders::{DashboardPage, EditOrderPage, OrderDetailPage, OrderEditor};
 
 /// Renders the full HTML document for every server-rendered response.
 ///
@@ -82,8 +82,11 @@ pub fn App() -> impl IntoView {
                 // route of its own — only the flattened leaves below are
                 // registered with Axum.
                 <ParentRoute path=path!("") view=Shell>
+                    // The dashboard *is* the order list. A second route
+                    // rendering the same table under `/orders` would be two
+                    // URLs for one page, and the status filter would have to
+                    // know which of them it was living on to build its links.
                     <Route path=path!("") view=DashboardPage />
-                    <Route path=path!("orders") view=OrdersPage />
                     // Before `orders/:id`, or "new" would be matched as an id.
                     <Route path=path!("orders/new") view=NewOrderPage />
                     <Route path=path!("orders/:id") view=OrderDetailPage />
@@ -181,9 +184,6 @@ fn Chrome(children: Children) -> impl IntoView {
                         </A>
                     </li>
                     <li>
-                        <A href="/orders">"Orders"</A>
-                    </li>
-                    <li>
                         <A href="/orders/new">"New order"</A>
                     </li>
                     // Resolves asynchronously and renders nothing until it
@@ -233,50 +233,9 @@ fn NotFound() -> impl IntoView {
 // ---------------------------------------------------------------------------
 // Placeholder pages
 //
-// Each is replaced by the feature named in its body. They exist now so the
-// route table, navigation, and layout can be exercised and reviewed before any
-// data model exists.
+// One left: the create form's page wrapper. Every other placeholder has been
+// replaced by the feature named in its body.
 // ---------------------------------------------------------------------------
-
-#[component]
-fn DashboardPage() -> impl IntoView {
-    view! {
-        <Title text="Dashboard - Orders and Settlements" />
-        <h1>"Dashboard"</h1>
-        <p>
-            "The order summary table, status filters, and outstanding totals arrive in Feature 8."
-        </p>
-
-        // Not decoration and not sample data: the shared components below have
-        // no other caller until Feature 5, and the review needs to see them
-        // render and take keyboard focus. Feature 8 replaces this section with
-        // the real dashboard.
-        <article>
-            <header>
-                <h2>"Shared components"</h2>
-            </header>
-            <p>"Status tones, as derived by Feature 5:"</p>
-            <p>
-                <StatusBadge status="pending" />
-                " "
-                <StatusBadge status="partially_paid" />
-                " "
-                <StatusBadge status="paid" />
-                " "
-                <StatusBadge status="overdue" />
-            </p>
-            <p>
-                "Money rendering: " <MoneyText cents=0 /> ", " <MoneyText cents=123456 /> ", "
-                <MoneyText cents=-2550 /> "."
-            </p>
-            <label>
-                "Focus target"
-                <input type="text" placeholder="Tab to me to check the focus ring" />
-            </label>
-            <FieldError message=Some("Field errors render like this.".to_string()) />
-        </article>
-    }
-}
 
 #[component]
 fn NewOrderPage() -> impl IntoView {

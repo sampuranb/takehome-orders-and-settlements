@@ -28,9 +28,9 @@ use orders_and_settlements::orders::ssr::{
     list_orders_for_user, update_order_service,
 };
 use orders_and_settlements::orders::{
-    calculate_line_total_cents, calculate_order_total_cents, derive_order_status,
-    validate_create_order, NewOrderInput, OrderItemInput, OrderStatus, ValidatedItem,
-    ValidatedOrder, MAX_ITEMS,
+    calculate_line_total_cents, calculate_order_total_cents, derive_order_status, filter_by_status,
+    summarise_orders, validate_create_order, NewOrderInput, OrderItemInput, OrderStatus,
+    OrderSummary, ValidatedItem, ValidatedOrder, MAX_ITEMS,
 };
 use orders_and_settlements::payments::ssr::record_payment_service;
 use orders_and_settlements::payments::NewPaymentInput;
@@ -1017,6 +1017,243 @@ async fn a_stranger_cannot_read_the_payment_history() {
             .expect_err("not the stranger's order"),
         AppError::NotFound
     );
+
+    cleanup(&pool, &owner).await;
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard: filter parsing, totals, and the status filter
+// ---------------------------------------------------------------------------
+
+/// A summary built by hand, so the totals can be tested without a database.
+fn summary(status: OrderStatus, total: i64, paid: i64) -> OrderSummary {
+    OrderSummary {
+        id: Uuid::now_v7(),
+        customer: "Acme Corp".to_string(),
+        due_date: NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
+        total_cents: total,
+        paid_cents: paid,
+        item_count: 1,
+        status,
+    }
+}
+
+#[test]
+fn every_status_survives_a_round_trip_through_the_url() {
+    for status in OrderStatus::ALL {
+        assert_eq!(
+            OrderStatus::parse(status.as_str()),
+            Some(status),
+            "?status={} must parse back to the status that wrote it",
+            status.as_str()
+        );
+    }
+}
+
+#[test]
+fn an_unrecognised_filter_is_no_filter_rather_than_an_error() {
+    // A URL is typed, pasted and truncated by people. Every one of these has to
+    // land on the dashboard showing everything, not on an error page.
+    for raw in ["", "paid ", "PAID", "pad", "partially-paid", "settled", "1"] {
+        assert_eq!(
+            OrderStatus::parse(raw),
+            None,
+            "{raw:?} is not a status and must not be treated as one"
+        );
+    }
+}
+
+#[test]
+fn the_totals_of_nothing_are_zero() {
+    let totals = summarise_orders(&[]);
+
+    assert_eq!(totals.order_count, 0);
+    assert_eq!(totals.total_cents, 0);
+    assert_eq!(totals.paid_cents, 0);
+    assert_eq!(totals.outstanding_cents, 0);
+    for status in OrderStatus::ALL {
+        assert_eq!(totals.count_of(status), 0);
+    }
+}
+
+#[test]
+fn the_tiles_count_every_status_and_add_up_the_money() {
+    let orders = vec![
+        summary(OrderStatus::Pending, 10_000, 0),
+        summary(OrderStatus::PartiallyPaid, 20_000, 5_000),
+        summary(OrderStatus::Paid, 30_000, 30_000),
+        summary(OrderStatus::Overdue, 40_000, 0),
+        summary(OrderStatus::Overdue, 1_000, 250),
+    ];
+
+    let totals = summarise_orders(&orders);
+
+    assert_eq!(totals.order_count, 5);
+    assert_eq!(totals.count_of(OrderStatus::Pending), 1);
+    assert_eq!(totals.count_of(OrderStatus::PartiallyPaid), 1);
+    assert_eq!(totals.count_of(OrderStatus::Paid), 1);
+    assert_eq!(totals.count_of(OrderStatus::Overdue), 2);
+
+    assert_eq!(totals.total_cents, 101_000);
+    assert_eq!(totals.paid_cents, 35_250);
+    // 10_000 + 15_000 + 0 + 40_000 + 750.
+    assert_eq!(totals.outstanding_cents, 65_750);
+}
+
+#[test]
+fn outstanding_is_the_sum_of_what_each_order_owes() {
+    // An overpaid order owes nothing. It must not lend its surplus to the order
+    // beside it, which is what both `total_cents - paid_cents` across the whole
+    // set and a plain sum of `amount_due_cents()` would do: the £5 credit on the
+    // settled invoice would pay down £5 of the pending one.
+    let orders = vec![
+        summary(OrderStatus::Paid, 5_000, 5_500),
+        summary(OrderStatus::Pending, 10_000, 0),
+    ];
+
+    let totals = summarise_orders(&orders);
+
+    // £100.00 is owed, on the pending order, by itself.
+    assert_eq!(totals.outstanding_cents, 10_000);
+    // And the two shortcuts really do disagree with that — 15_000 - 5_500
+    // reports £95.00 outstanding. That disagreement is the whole test.
+    assert_eq!(totals.total_cents - totals.paid_cents, 9_500);
+}
+
+#[test]
+fn no_filter_shows_every_order() {
+    let orders = vec![
+        summary(OrderStatus::Pending, 100, 0),
+        summary(OrderStatus::Paid, 100, 100),
+    ];
+
+    assert_eq!(filter_by_status(orders.clone(), None), orders);
+}
+
+#[test]
+fn a_filter_keeps_only_its_own_status() {
+    let orders = vec![
+        summary(OrderStatus::Pending, 100, 0),
+        summary(OrderStatus::Paid, 100, 100),
+        summary(OrderStatus::Pending, 200, 0),
+    ];
+
+    let pending = filter_by_status(orders.clone(), Some(OrderStatus::Pending));
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|o| o.status == OrderStatus::Pending));
+
+    // A status nobody is in is an empty table, not an error and not everything.
+    assert!(filter_by_status(orders, Some(OrderStatus::Overdue)).is_empty());
+}
+
+#[tokio::test]
+async fn the_dashboard_reports_one_owner_and_reaches_every_status() {
+    let pool = connect().await;
+    let owner = test_owner();
+    let stranger = test_owner();
+
+    let today = chrono::Utc::now().date_naive();
+    let past = (today - chrono::Duration::days(10)).to_string();
+    let future = (today + chrono::Duration::days(10)).to_string();
+
+    let mut pending = order(vec![item("Pending work", "1", "100.00")]);
+    pending.due_date = future.clone();
+    let pending_id = create_order_service(&pool, &owner, &pending)
+        .await
+        .expect("valid");
+
+    let mut partial = order(vec![item("Partial work", "1", "200.00")]);
+    partial.due_date = future.clone();
+    let partial_id = create_order_service(&pool, &owner, &partial)
+        .await
+        .expect("valid");
+    record_payment_service(&pool, &owner, partial_id, &payment("50.00", &past))
+        .await
+        .expect("within the balance");
+
+    // Due in the past *and* settled: the precedence in `derive_order_status`
+    // says paid wins, and the dashboard has to agree — an invoice nobody owes
+    // anything on is not overdue, however old it is.
+    let mut settled = order(vec![item("Settled work", "1", "300.00")]);
+    settled.due_date = past.clone();
+    let settled_id = create_order_service(&pool, &owner, &settled)
+        .await
+        .expect("valid");
+    record_payment_service(&pool, &owner, settled_id, &payment("300.00", &past))
+        .await
+        .expect("settles it");
+
+    let mut overdue = order(vec![item("Late work", "1", "400.00")]);
+    overdue.due_date = past.clone();
+    let overdue_id = create_order_service(&pool, &owner, &overdue)
+        .await
+        .expect("valid");
+
+    // Somebody else's order, in a status the owner also has. It must not appear
+    // in the owner's list, and must not be counted in the owner's tiles.
+    let mut theirs = order(vec![item("Not yours", "1", "999.00")]);
+    theirs.due_date = future;
+    create_order_service(&pool, &stranger, &theirs)
+        .await
+        .expect("valid");
+
+    let all = list_orders_for_user(&pool, &owner).await.expect("readable");
+    let totals = summarise_orders(&all);
+
+    assert_eq!(totals.order_count, 4, "the stranger's order is not counted");
+    assert_eq!(totals.total_cents, 100_000);
+    assert_eq!(totals.paid_cents, 35_000);
+    assert_eq!(totals.outstanding_cents, 65_000);
+
+    for status in OrderStatus::ALL {
+        assert_eq!(
+            totals.count_of(status),
+            1,
+            "expected exactly one {} order",
+            status.as_str()
+        );
+    }
+
+    let ids = |status| -> Vec<Uuid> {
+        filter_by_status(all.clone(), Some(status))
+            .into_iter()
+            .map(|order| order.id)
+            .collect()
+    };
+
+    assert_eq!(ids(OrderStatus::Pending), vec![pending_id]);
+    assert_eq!(ids(OrderStatus::PartiallyPaid), vec![partial_id]);
+    assert_eq!(ids(OrderStatus::Paid), vec![settled_id]);
+    assert_eq!(ids(OrderStatus::Overdue), vec![overdue_id]);
+
+    // The paid order is due in the past and is still not in the overdue list.
+    assert!(!ids(OrderStatus::Overdue).contains(&settled_id));
+
+    cleanup(&pool, &owner).await;
+    cleanup(&pool, &stranger).await;
+}
+
+#[tokio::test]
+async fn a_new_owner_sees_an_empty_dashboard_rather_than_everyone_elses() {
+    let pool = connect().await;
+    let owner = test_owner();
+    let newcomer = test_owner();
+
+    create_order_service(&pool, &owner, &order(vec![item("Work", "1", "10.00")]))
+        .await
+        .expect("valid");
+
+    let all = list_orders_for_user(&pool, &newcomer)
+        .await
+        .expect("readable");
+    let totals = summarise_orders(&all);
+
+    assert!(all.is_empty());
+    assert_eq!(totals.order_count, 0);
+    assert_eq!(totals.outstanding_cents, 0);
+    // No orders at all, so every filter is empty too — the page says "no orders
+    // yet", not "no paid orders".
+    assert!(filter_by_status(all, Some(OrderStatus::Paid)).is_empty());
 
     cleanup(&pool, &owner).await;
 }

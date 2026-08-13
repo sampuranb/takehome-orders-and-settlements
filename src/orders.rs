@@ -26,7 +26,7 @@ use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 use leptos_meta::Title;
 use leptos_router::components::A;
-use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 use leptos_router::NavigateOptions;
 use serde::{Deserialize, Serialize};
 
@@ -205,6 +205,143 @@ impl OrderStatus {
             Self::Overdue => "overdue",
         }
     }
+
+    /// What a person reads.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::PartiallyPaid => "Partially paid",
+            Self::Paid => "Paid",
+            Self::Overdue => "Overdue",
+        }
+    }
+
+    /// Every variant, in the order the dashboard filter lists them.
+    ///
+    /// Exhaustive by construction rather than by discipline: adding a variant
+    /// to the enum breaks [`as_str`](Self::as_str)'s `match`, and the compiler
+    /// stops there before this array can silently omit it from the filter.
+    pub const ALL: [OrderStatus; 4] = [
+        Self::Pending,
+        Self::PartiallyPaid,
+        Self::Paid,
+        Self::Overdue,
+    ];
+
+    /// The inverse of [`as_str`](Self::as_str), for a `?status=` query value.
+    ///
+    /// Returns `None` for anything unrecognised, and the caller is expected to
+    /// read that as "no filter" rather than as an error. A URL is typed, pasted
+    /// and truncated by people; `?status=pad` should show the dashboard, not an
+    /// error page, because the request is still perfectly answerable — the user
+    /// simply named no filter this code recognises.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|status| status.as_str() == raw)
+    }
+}
+
+/// The counts and money printed above the dashboard table.
+///
+/// Always describes **every** order the caller owns, never the filtered subset.
+/// The tiles are the reason to click a filter, so they have to keep reporting
+/// what is there while you are looking at one slice of it — a filtered count
+/// would answer a question nobody asked ("how many overdue orders are overdue")
+/// and lose the one being asked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DashboardTotals {
+    pub order_count: usize,
+    /// Billed across every order, paid or not.
+    pub total_cents: i64,
+    pub paid_cents: i64,
+    /// What is still owed: the sum of each order's own amount due, with an
+    /// overpaid order contributing zero rather than a negative.
+    ///
+    /// Not `total_cents - paid_cents`. Those two differ the moment one order is
+    /// overpaid, and the difference is not a rounding detail — a £5 surplus on
+    /// a settled invoice would silently pay down £5 of a different customer's
+    /// balance, and the dashboard would under-report what is actually owed.
+    /// Money owed on one order is not money owed on another, so the sum is
+    /// taken per order and a credit is never allowed to travel.
+    ///
+    /// Overpayment is refused on the way in ([`crate::payments::record_payment`]),
+    /// so a negative amount due means the row was written by something other
+    /// than this application. The clamp is what keeps that a display oddity on
+    /// one row instead of a wrong figure at the top of the page.
+    pub outstanding_cents: i64,
+    /// How many orders sit in each status, in [`OrderStatus::ALL`] order.
+    pub by_status: [usize; 4],
+}
+
+impl DashboardTotals {
+    pub fn count_of(&self, status: OrderStatus) -> usize {
+        self.by_status[OrderStatus::ALL
+            .iter()
+            .position(|candidate| *candidate == status)
+            .expect("ALL contains every variant")]
+    }
+}
+
+/// Adds up a list of summaries. Pure, so the totals are testable without a
+/// database and cannot drift from the rows they describe — both come from one
+/// `Vec<OrderSummary>` in [`list_orders`].
+///
+/// Saturating rather than checked: this is a display figure derived from values
+/// that were each already validated on the way in, and a dashboard that refuses
+/// to render because a hypothetical sum overflowed is worse than one that pins
+/// at `i64::MAX`. The write paths that must not be wrong stay checked.
+pub fn summarise_orders(orders: &[OrderSummary]) -> DashboardTotals {
+    let mut totals = DashboardTotals {
+        order_count: orders.len(),
+        ..Default::default()
+    };
+
+    for order in orders {
+        totals.total_cents = totals.total_cents.saturating_add(order.total_cents);
+        totals.paid_cents = totals.paid_cents.saturating_add(order.paid_cents);
+        totals.outstanding_cents = totals
+            .outstanding_cents
+            .saturating_add(order.amount_due_cents().max(0));
+
+        let slot = OrderStatus::ALL
+            .iter()
+            .position(|candidate| *candidate == order.status)
+            .expect("ALL contains every variant");
+        totals.by_status[slot] += 1;
+    }
+
+    totals
+}
+
+/// Keeps the orders matching `filter`, or all of them when there is no filter.
+///
+/// A free function, and the only place the dashboard's filter is applied, so
+/// "does `?status=paid` mean the same thing as the Paid badge" is one assertion
+/// against one function rather than a property of a request handler.
+pub fn filter_by_status(
+    orders: Vec<OrderSummary>,
+    filter: Option<OrderStatus>,
+) -> Vec<OrderSummary> {
+    match filter {
+        // Compares the derived status, never re-derives it. This function
+        // cannot invent a fifth answer, because it does not compute any.
+        Some(wanted) => orders
+            .into_iter()
+            .filter(|order| order.status == wanted)
+            .collect(),
+        None => orders,
+    }
+}
+
+/// What the dashboard renders: the whole picture, and the slice being viewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dashboard {
+    /// Over every order the caller owns, regardless of `filter`.
+    pub totals: DashboardTotals,
+    /// The filter that produced `orders`, echoed back so the page renders the
+    /// filter the server actually applied rather than the one the URL asked
+    /// for. They differ whenever `?status=` names something unrecognised.
+    pub filter: Option<OrderStatus>,
+    pub orders: Vec<OrderSummary>,
 }
 
 /// Derives an order's status. The only place this decision is made.
@@ -1110,13 +1247,24 @@ pub async fn delete_order(id: Uuid) -> Result<(), AppError> {
     )
 }
 
-/// Every order the caller owns.
+/// Every order the caller owns, and the totals across all of them.
 ///
 /// A read, so there is no same-origin check: a `GET`-shaped request that leaks
 /// nothing to a third party — the response is only readable by the origin that
 /// made it — and `require_user` is what decides whose orders these are.
+///
+/// `filter` is applied **here, in Rust, after [`derive_order_status`]** — never
+/// as a `WHERE` clause. A SQL predicate would be a second copy of the status
+/// rule, written in a different language, and the first day the two disagree
+/// the dashboard shows an order under a badge that contradicts the filter that
+/// found it. The status is derived exactly once, in exactly one place, and the
+/// filter is a test against the answer.
+///
+/// Reading every row and discarding some of them is the cost of that, and it is
+/// the right trade at this size: the caller's own orders are a page of rows, not
+/// a table scan. The totals want the whole set anyway.
 #[server]
-pub async fn list_orders() -> Result<Vec<OrderSummary>, AppError> {
+pub async fn list_orders(filter: Option<OrderStatus>) -> Result<Dashboard, AppError> {
     use crate::auth::ssr::require_user;
     use crate::error::ssr::report;
     use ssr::{list_orders_for_user, pool};
@@ -1125,7 +1273,16 @@ pub async fn list_orders() -> Result<Vec<OrderSummary>, AppError> {
         async move {
             let user = require_user().await?;
 
-            list_orders_for_user(&pool()?, &user.id).await
+            let all = list_orders_for_user(&pool()?, &user.id).await?;
+            // Totals first, over the unfiltered list: the tiles describe
+            // everything the caller owns whatever slice they are looking at.
+            let totals = summarise_orders(&all);
+
+            Ok(Dashboard {
+                totals,
+                filter,
+                orders: filter_by_status(all, filter),
+            })
         }
         .await,
     )
@@ -1578,80 +1735,257 @@ fn LoadFailure(error: AppError) -> impl IntoView {
     }
 }
 
-/// The order list: everything the signed-in user owns, soonest due first.
+/// One link in the status filter.
+///
+/// A plain `<a>`, not the router's `<A>`. Every link here shares the path `/`
+/// and differs only in the query string, and `<A>` decides "am I the current
+/// page?" by comparing paths — so it would stamp `aria-current="page"` on all
+/// five at once and tell a screen-reader user that they are on five pages.
+/// The current one is known here, from the filter the server echoed back, so it
+/// is marked here. The router still intercepts the click; nothing reloads.
 #[component]
-pub fn OrdersPage() -> impl IntoView {
-    let orders = Resource::new(|| (), |()| list_orders());
+fn FilterLink(href: String, label: &'static str, count: usize, selected: bool) -> impl IntoView {
+    view! {
+        <a href=href aria-current=selected.then_some("page") class="filter-link">
+            {label}
+            <span class="filter-count" aria-hidden="true">
+                {count}
+            </span>
+            // The bare number above is decoration to a screen reader, which
+            // would otherwise hear "Overdue 3" as a heading and not as a count.
+            <span class="visually-hidden">
+                {if count == 1 {
+                    " (1 order)".to_string()
+                } else {
+                    format!(" ({count} orders)")
+                }}
+            </span>
+        </a>
+    }
+}
+
+/// The status filter, driven entirely by the URL.
+///
+/// The links are the state. There is no local signal holding "the selected
+/// filter", because that would be a second answer to a question `?status=`
+/// already answers — and a wrong one the moment somebody uses the Back button.
+/// Clicking a link changes the query, which changes the resource's source,
+/// which refetches. Sharing the URL shares the filter, and the server renders
+/// it filtered on first paint.
+#[component]
+fn StatusFilter(totals: DashboardTotals, current: Option<OrderStatus>) -> impl IntoView {
+    view! {
+        <nav class="status-filter" aria-label="Filter orders by status">
+            <FilterLink
+                href="/".to_string()
+                label="All"
+                count=totals.order_count
+                selected=current.is_none()
+            />
+            {OrderStatus::ALL
+                .into_iter()
+                .map(|status| {
+                    view! {
+                        <FilterLink
+                            href=format!("/?status={}", status.as_str())
+                            label=status.label()
+                            count=totals.count_of(status)
+                            selected=current == Some(status)
+                        />
+                    }
+                })
+                .collect::<Vec<_>>()}
+        </nav>
+    }
+}
+
+/// The four figures above the table.
+///
+/// Every one of them was added up on the server, by [`summarise_orders`], from
+/// the same rows the table below renders. Nothing here sums anything: a browser
+/// that computed its own outstanding total would be a second implementation of
+/// the amount-due rule, and the one place it could disagree with the server is
+/// the one number a person acts on.
+#[component]
+fn DashboardTiles(totals: DashboardTotals) -> impl IntoView {
+    view! {
+        <section class="dashboard-tiles" aria-label="Totals across all orders">
+            <article>
+                <h2>"Orders"</h2>
+                <p class="tile-figure">{totals.order_count}</p>
+            </article>
+            <article>
+                <h2>"Billed"</h2>
+                <p class="tile-figure">
+                    <MoneyText cents=totals.total_cents />
+                </p>
+            </article>
+            <article>
+                <h2>"Paid"</h2>
+                <p class="tile-figure">
+                    <MoneyText cents=totals.paid_cents />
+                </p>
+            </article>
+            <article>
+                <h2>"Outstanding"</h2>
+                <p class="tile-figure">
+                    <MoneyText cents=totals.outstanding_cents />
+                </p>
+            </article>
+        </section>
+    }
+}
+
+/// The dashboard: totals, the status filter, and every order the caller owns.
+///
+/// The URL is the input. `use_query_map` is a signal, so `?status=` is folded
+/// straight into the resource's source — changing the filter changes the key,
+/// and the key changing is what refetches. There is no click handler and no
+/// local "selected" state to keep in step with the address bar.
+///
+/// The filter is sent to the server rather than applied to a list already in
+/// the browser. That costs a round trip per click and buys the thing that
+/// matters: a pasted `/?status=overdue` is server-rendered as the overdue list,
+/// by the same code path, instead of arriving as the full list and flickering
+/// down to a subset once the WASM bundle has loaded.
+#[component]
+pub fn DashboardPage() -> impl IntoView {
+    let query = use_query_map();
+    // Unrecognised and absent are the same answer — see `OrderStatus::parse`.
+    let filter = Memo::new(move |_| {
+        query
+            .read()
+            .get("status")
+            .and_then(|raw| OrderStatus::parse(&raw))
+    });
+
+    let dashboard = Resource::new(move || filter.get(), list_orders);
 
     view! {
-        <Title text="Orders - Orders and Settlements" />
-        <h1>"Orders"</h1>
+        <Title text="Dashboard - Orders and Settlements" />
+        <h1>"Dashboard"</h1>
 
+        // `Transition`, not `Suspense`: switching filters refetches, and a
+        // `Suspense` would blank the whole dashboard back to "Loading orders…"
+        // on every click. This keeps the previous list on screen until the next
+        // one arrives.
         <Transition fallback=|| view! { <p aria-busy="true">"Loading orders…"</p> }>
             {move || Suspend::new(async move {
-                match orders.await {
+                match dashboard.await {
                     Err(error) => view! { <LoadFailure error /> }.into_any(),
-                    Ok(orders) if orders.is_empty() => {
+                    Ok(dashboard) => {
+                        let totals = dashboard.totals;
+                        let filter = dashboard.filter;
+                        let orders = dashboard.orders;
                         view! {
-                            <article class="empty-state">
-                                <p>"No orders yet."</p>
-                                <A href="/orders/new">"Create the first one"</A>
-                            </article>
-                        }
-                            .into_any()
-                    }
-                    Ok(orders) => {
-                        view! {
-                            <table class="order-table">
-                                <thead>
-                                    <tr>
-                                        <th scope="col">"Customer"</th>
-                                        <th scope="col">"Due"</th>
-                                        <th scope="col">"Status"</th>
-                                        <th scope="col">"Items"</th>
-                                        <th scope="col">"Total"</th>
-                                        <th scope="col">"Due now"</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {orders
-                                        .into_iter()
-                                        .map(|order| {
-                                            let href = format!("/orders/{}", order.id);
-                                            let due = order.due_date.to_string();
-                                            let amount_due = order.amount_due_cents();
-                                            view! {
-                                                <tr>
-                                                    <td>
-                                                        // The customer name is the link, so the
-                                                        // target is named rather than being a bare
-                                                        // "view" a screen reader reads out of
-                                                        // context.
-                                                        <A href=href>{order.customer}</A>
-                                                    </td>
-                                                    <td>{due}</td>
-                                                    <td>
-                                                        <StatusBadge status=order.status.as_str() />
-                                                    </td>
-                                                    <td>{order.item_count}</td>
-                                                    <td>
-                                                        <MoneyText cents=order.total_cents />
-                                                    </td>
-                                                    <td>
-                                                        <MoneyText cents=amount_due />
-                                                    </td>
-                                                </tr>
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()}
-                                </tbody>
-                            </table>
+                            <DashboardTiles totals />
+                            // Rendered even when the caller owns nothing, so
+                            // the counts are visible proof that "no orders" is
+                            // the whole picture and not a filter hiding them.
+                            <StatusFilter totals current=filter />
+                            {if orders.is_empty() {
+                                empty_state(totals.order_count == 0, filter).into_any()
+                            } else {
+                                order_table(orders).into_any()
+                            }}
                         }
                             .into_any()
                     }
                 }
             })}
         </Transition>
+    }
+}
+
+/// Nothing to show, and which of the two reasons it is.
+///
+/// "You have no orders" and "this filter matches none of your orders" are
+/// different facts with different next actions — create one, or clear the
+/// filter — and collapsing them into one message sends half the readers to the
+/// wrong button.
+///
+/// A function rather than a component: it takes no props a caller could get
+/// wrong and has exactly one call site, in [`DashboardPage`].
+fn empty_state(no_orders_at_all: bool, filter: Option<OrderStatus>) -> impl IntoView {
+    let filtered = filter.filter(|_| !no_orders_at_all);
+
+    view! {
+        <article class="empty-state">
+            {match filtered {
+                None => {
+                    view! {
+                        <p>"No orders yet."</p>
+                        <A href="/orders/new">"Create the first one"</A>
+                    }
+                        .into_any()
+                }
+                Some(status) => {
+                    view! {
+                        <p>{format!("No {} orders.", status.label().to_lowercase())}</p>
+                        <a href="/">"Show every order"</a>
+                    }
+                        .into_any()
+                }
+            }}
+        </article>
+    }
+}
+
+/// The order table: one row per order, soonest due first.
+///
+/// Every column is a value the server sent down finished. `amount_due_cents`
+/// is the one arithmetic here and it is a subtraction of two server-derived
+/// figures on the same DTO, not a rule the browser applies.
+fn order_table(orders: Vec<OrderSummary>) -> impl IntoView {
+    view! {
+        <table class="order-table">
+            <thead>
+                <tr>
+                    <th scope="col">"Customer"</th>
+                    <th scope="col">"Due"</th>
+                    <th scope="col">"Status"</th>
+                    <th scope="col">"Items"</th>
+                    <th scope="col">"Total"</th>
+                    <th scope="col">"Paid"</th>
+                    <th scope="col">"Due now"</th>
+                </tr>
+            </thead>
+            <tbody>
+                {orders
+                    .into_iter()
+                    .map(|order| {
+                        let href = format!("/orders/{}", order.id);
+                        let due = order.due_date.to_string();
+                        let amount_due = order.amount_due_cents();
+                        view! {
+                            <tr>
+                                <td>
+                                    // The customer name is the link, so the
+                                    // target is named rather than being a bare
+                                    // "view" a screen reader reads out of
+                                    // context.
+                                    <A href=href>{order.customer}</A>
+                                </td>
+                                <td>{due}</td>
+                                <td>
+                                    <StatusBadge status=order.status.as_str() />
+                                </td>
+                                <td>{order.item_count}</td>
+                                <td>
+                                    <MoneyText cents=order.total_cents />
+                                </td>
+                                <td>
+                                    <MoneyText cents=order.paid_cents />
+                                </td>
+                                <td>
+                                    <MoneyText cents=amount_due />
+                                </td>
+                            </tr>
+                        }
+                    })
+                    .collect::<Vec<_>>()}
+            </tbody>
+        </table>
     }
 }
 
@@ -1687,7 +2021,7 @@ pub fn OrderDetailPage() -> impl IntoView {
     Effect::new(move |_| {
         if let Some(Ok(())) = delete.value().get() {
             navigate(
-                "/orders",
+                "/",
                 NavigateOptions {
                     replace: true,
                     ..Default::default()

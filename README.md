@@ -89,8 +89,7 @@ cannot serve.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Readiness probe; `200` when PostgreSQL answers, `503` when it does not |
-| `GET` | `/` | Dashboard |
-| `GET` | `/orders` | Order list |
+| `GET` | `/` | Dashboard: totals, status filter, and the order list |
 | `GET` | `/orders/new` | Order editor |
 | `GET` | `/orders/:id` | Order detail |
 | `GET` | `/auth` | Sign in and sign up |
@@ -101,7 +100,7 @@ cannot serve.
 | `POST` | `/api/create_order*` | Server function: validate and persist an order (JSON body) |
 | `POST` | `/api/update_order*` | Server function: revalidate and replace an order (JSON body) |
 | `POST` | `/api/delete_order*` | Server function: delete an order and its line items |
-| `POST` | `/api/list_orders*` | Server function: the caller's orders with derived status |
+| `POST` | `/api/list_orders*` | Server function: the caller's orders with derived status, totals, and an optional status filter |
 | `POST` | `/api/get_order*` | Server function: one order with its line items |
 | `POST` | `/api/record_payment*` | Server function: record a payment against an order (JSON body) |
 | `GET` | `/pkg/*` | Hydration bundle and stylesheet |
@@ -249,6 +248,45 @@ Payments on the same day are ordered by id, which is UUID v7 — so the tiebreak
 means "recorded later", not an arbitrary byte comparison, and two reads of the
 same page cannot shuffle the rows.
 
+## Dashboard
+
+The dashboard at `/` is the order list. There is no second `/orders` page: two
+URLs rendering one table would mean the status filter had to know which of them
+it was living on in order to build its own links.
+
+The filter is the URL. `?status=paid` is read with `use_query_map`, parsed by
+`OrderStatus::parse`, and folded into the resource's source signal — so changing
+the filter changes the key, and the key changing is what refetches. There is no
+local "selected filter" signal to fall out of step with the address bar, and the
+Back button works because the browser's history *is* the state.
+
+An unrecognised `?status=` value is treated as no filter rather than as an
+error. URLs are typed, pasted and truncated by people, and `?status=pad` is
+still a perfectly answerable request: show everything.
+
+Filtering happens in Rust, over the list `derive_order_status` has already
+labelled — never as a SQL `WHERE` clause. A predicate in SQL would be a second
+copy of the status rule in a second language, and the first day the two disagree
+the dashboard shows an order under a badge that contradicts the filter that
+found it. Reading every row and discarding some is the cost of keeping one rule;
+at the size of one user's orders it is not a real cost, and the totals need the
+whole set anyway.
+
+The filter is applied on the server rather than to a list already in the
+browser, so a pasted `/?status=overdue` is server-rendered as the overdue list
+by the same code path, instead of arriving as everything and flickering down to
+a subset once the WASM bundle loads.
+
+The four tiles always describe **every** order the caller owns, whatever filter
+is applied — they are the reason to click a filter, so they have to keep
+reporting what is there. "Outstanding" is the sum of each order's own amount
+due, clamped at zero, not `billed - paid`: a credit on an overpaid invoice must
+not quietly pay down a different customer's balance.
+
+Two empty states, because they are two different facts with two different next
+actions: "no orders yet", which offers the create form, and "no overdue
+orders", which offers a way back to the full list.
+
 ## Third-party assets
 
 `style/main.css` begins with [Pico CSS](https://picocss.com) v2.1.1, vendored
@@ -313,6 +351,15 @@ no payments shows no history section at all, the first payment makes it appear
 in place without a page load, and a second payment on the same day is inserted
 above the first with the footer moving to "2 payments" and the new sum.
 
+The dashboard filter was checked from both ends. The server-rendered HTML for
+`/?status=paid` was fetched directly and contains one order row where `/`
+contains four, `/?status=overdue` contains no table at all, and
+`/?status=nonsense` contains the full list with "All" marked current — so a
+shared link is filtered before any JavaScript runs. In the browser, clicking
+through the filters changes the table and the marked pill without a page load,
+the tiles stay on the unfiltered totals throughout, and the Back button returns
+to the previous filter.
+
 ## Current status
 
 Implemented:
@@ -334,10 +381,11 @@ Implemented:
 - Payments and amount due, with overpayment refused under concurrency
 - Orders locked against edit and delete once money is recorded against them
 - One authoritative detail view: items, payment history, totals, and actions
+- Dashboard: totals across every order, and a shareable URL-driven status filter
 
 Not yet implemented:
 
-- Dashboard and status filter; REST API
+- REST API
 - Deployment and the deployed URL
 
 ## License
