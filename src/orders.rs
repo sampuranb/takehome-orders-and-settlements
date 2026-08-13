@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::app::{FieldError, MoneyText, StatusBadge};
 use crate::error::{AppError, AppResult};
+use crate::payments::{calculate_maximum_payment_cents, PaymentForm, RecordPayment};
 
 /// Upper bound on line items in one order.
 ///
@@ -150,6 +151,11 @@ pub struct OrderDetail {
     /// hide the edit and delete controls; the server re-derives it inside the
     /// transaction, because hiding a control is not the same as refusing one.
     pub editable: bool,
+    /// The server's today, the same value [`OrderStatus`] above was derived
+    /// against. Sent down so the payment form's default date and the overdue
+    /// rule cannot disagree — the browser's own clock is a different machine's
+    /// opinion, and it is the one that can be wrong.
+    pub today: NaiveDate,
     pub items: Vec<OrderLine>,
 }
 
@@ -544,19 +550,20 @@ pub mod ssr {
         Utc::now().date_naive()
     }
 
-    // Three statements below project `paid_cents` as `0::BIGINT` and
-    // `has_payments` as `FALSE`. **Feature 6 replaces those two literals**,
-    // with
+    // `paid_cents` and `has_payments` are read as correlated subqueries against
+    // `payments` rather than by a second round trip, so an order and the money
+    // against it are answered by one statement and cannot disagree.
     //
-    //   COALESCE((SELECT sum(amount_cents) FROM payments
-    //             WHERE payments.order_id = orders.id), 0)
-    //   EXISTS   (SELECT 1 FROM payments WHERE payments.order_id = orders.id)
+    // Neither the `COALESCE` nor the `::BIGINT` is decoration, and both fail in
+    // the same place — at decode time, with an opaque error:
     //
-    // They are projected columns rather than Rust constants so the shape of
-    // each read — and of the row struct it decodes into — is already the shape
-    // Feature 6 needs. SQLx 0.9 only accepts `&'static str` as a statement, so
-    // they are written out in each query rather than interpolated from one
-    // constant; that also keeps every statement greppable as the SQL it is.
+    //   COALESCE  a bare `sum()` over no rows is SQL NULL, not `0`, so `i64`
+    //             cannot receive it. That is every order until its first
+    //             payment, which is the default state of every order.
+    //   ::BIGINT  `sum(bigint)` returns NUMERIC in Postgres, not BIGINT — it is
+    //             widened so a sum of many bigints cannot overflow. `i64`
+    //             cannot receive that either, and the cast back is safe here
+    //             because the total it is compared against is itself an i64.
 
     /// One row of the order list, as the database returns it.
     ///
@@ -737,7 +744,11 @@ pub mod ssr {
                     orders.customer, \
                     orders.due_date, \
                     orders.total_cents, \
-                    0::BIGINT AS paid_cents, \
+                    COALESCE(( \
+                        SELECT sum(payments.amount_cents) \
+                        FROM payments \
+                        WHERE payments.order_id = orders.id \
+                    ), 0)::BIGINT AS paid_cents, \
                     count(order_items.id) AS item_count \
              FROM orders \
              LEFT JOIN order_items ON order_items.order_id = orders.id \
@@ -782,8 +793,14 @@ pub mod ssr {
                     customer, \
                     due_date, \
                     total_cents, \
-                    0::BIGINT AS paid_cents, \
-                    FALSE AS has_payments \
+                    COALESCE(( \
+                        SELECT sum(payments.amount_cents) \
+                        FROM payments \
+                        WHERE payments.order_id = orders.id \
+                    ), 0)::BIGINT AS paid_cents, \
+                    EXISTS ( \
+                        SELECT 1 FROM payments WHERE payments.order_id = orders.id \
+                    ) AS has_payments \
              FROM orders \
              WHERE id = $1 AND owner_user_id = $2",
         )
@@ -803,13 +820,13 @@ pub mod ssr {
         .fetch_all(pool)
         .await?;
 
+        // One `today` for the status and for the value sent to the browser, so
+        // a page cannot show a date the status was not derived against.
+        let today = today();
+
         Ok(OrderDetail {
-            status: derive_order_status(
-                order.total_cents,
-                order.paid_cents,
-                order.due_date,
-                today(),
-            ),
+            status: derive_order_status(order.total_cents, order.paid_cents, order.due_date, today),
+            today,
             editable: !order.has_payments,
             id: order.id,
             customer: order.customer,
@@ -835,14 +852,23 @@ pub mod ssr {
     /// Locks the caller's order for the rest of the transaction.
     ///
     /// `FOR UPDATE` on the order row is the serialization point for everything
-    /// that touches the order, including Feature 6's payment insert. Ownership
-    /// is part of the same `WHERE`, so a row that is not the caller's is never
-    /// locked and never found.
+    /// that touches the order, including the payment insert in
+    /// [`crate::payments`]. Ownership is part of the same `WHERE`, so a row that
+    /// is not the caller's is never locked and never found.
     ///
-    /// Postgres refuses `FOR UPDATE` alongside an aggregate, which is why the
-    /// lock is taken on the order row itself and the payment check below is a
+    /// **Every write path must call this first, on the same connection, inside
+    /// the same transaction.** The order row is being used as a proxy lock for
+    /// the payments table, which is what makes "read the sum, decide, insert"
+    /// safe under Postgres's default READ COMMITTED isolation: a second
+    /// transaction blocks here until the first commits, and its next statement
+    /// then runs against a snapshot that already includes the first payment. A
+    /// write that reads the sum *before* taking this lock reintroduces exactly
+    /// the race this design exists to close.
+    ///
+    /// Postgres refuses `FOR UPDATE` alongside an aggregate or a `GROUP BY`,
+    /// which is why the lock is taken on the order row alone and every sum is a
     /// separate statement.
-    async fn lock_owned_order(
+    pub async fn lock_owned_order(
         transaction: &mut PgConnection,
         owner_user_id: &str,
         order_id: Uuid,
@@ -859,24 +885,17 @@ pub mod ssr {
 
     /// Refuses to change an order that money has been recorded against.
     ///
-    /// **Feature 6 replaces the body** with a query against the payments table.
-    /// It is called here, inside the transaction and after the lock, because
-    /// that is the only position where the answer stays true until the commit —
-    /// adding it later would mean restructuring both write paths rather than
-    /// filling in one query.
-    ///
-    /// That guarantee is a contract with Feature 6, not a property of this
-    /// function: a payment insert that does not first call
-    /// [`lock_owned_order`] on the same order row can still commit between this
-    /// check and the commit below.
+    /// Called inside the transaction and after [`lock_owned_order`], which is
+    /// the only position where the answer stays true until the commit. Anywhere
+    /// earlier — including "just before `begin`" — a payment can land between
+    /// the check and the write, and the order changes underneath money that was
+    /// paid against the old version of it.
     async fn ensure_no_payments(transaction: &mut PgConnection, order_id: Uuid) -> AppResult<()> {
-        // Selected from `orders` rather than as a bare literal so the statement
-        // is already the shape Feature 6 needs, and so it reads the row this
-        // transaction just locked.
-        let has_payments: bool = sqlx::query_scalar("SELECT FALSE FROM orders WHERE id = $1")
-            .bind(order_id)
-            .fetch_one(&mut *transaction)
-            .await?;
+        let has_payments: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM payments WHERE order_id = $1)")
+                .bind(order_id)
+                .fetch_one(&mut *transaction)
+                .await?;
 
         if has_payments {
             tracing::info!(%order_id, "refused to change an order that has payments");
@@ -1616,9 +1635,15 @@ pub fn OrdersPage() -> impl IntoView {
 pub fn OrderDetailPage() -> impl IntoView {
     let order_id = use_order_id();
     let delete = ServerAction::<DeleteOrder>::new();
+    let record = ServerAction::<RecordPayment>::new();
+    // A recorded payment changes the paid amount, the amount due, the derived
+    // status, and whether the order can still be edited. Rather than patch any
+    // of those in the browser, the whole order is re-read: `version()` bumps on
+    // every completed payment, which changes this source and refetches. The
+    // page's numbers are the server's numbers or they are nothing.
     let order = Resource::new(
-        move || order_id.get(),
-        |order_id| async move {
+        move || (order_id.get(), record.version().get()),
+        |(order_id, _)| async move {
             match order_id {
                 Some(order_id) => get_order(order_id).await,
                 None => Err(AppError::NotFound),
@@ -1653,7 +1678,7 @@ pub fn OrderDetailPage() -> impl IntoView {
             {move || Suspend::new(async move {
                 match order.await {
                     Err(error) => view! { <LoadFailure error /> }.into_any(),
-                    Ok(order) => view! { <OrderDetailView order delete /> }.into_any(),
+                    Ok(order) => view! { <OrderDetailView order delete record /> }.into_any(),
                 }
             })}
         </Transition>
@@ -1663,10 +1688,18 @@ pub fn OrderDetailPage() -> impl IntoView {
 /// The loaded order. Split out so the page above holds only the loading and
 /// failure paths, and this holds only the rendering.
 #[component]
-fn OrderDetailView(order: OrderDetail, delete: ServerAction<DeleteOrder>) -> impl IntoView {
+fn OrderDetailView(
+    order: OrderDetail,
+    delete: ServerAction<DeleteOrder>,
+    record: ServerAction<RecordPayment>,
+) -> impl IntoView {
     let confirming = RwSignal::new(false);
     let order_id = order.id;
     let editable = order.editable;
+    let today = order.today;
+    // Computed by the same function the transaction uses, so the hint on the
+    // form and the limit the server enforces are one rule, not two.
+    let maximum_cents = calculate_maximum_payment_cents(order.total_cents, order.paid_cents);
 
     view! {
         <hgroup>
@@ -1733,6 +1766,17 @@ fn OrderDetailView(order: OrderDetail, delete: ServerAction<DeleteOrder>) -> imp
                         </p>
                     }
                 })
+        }}
+
+        // Hidden once nothing is owed, rather than shown and refused. The
+        // server refuses it either way — `record_payment` re-reads the balance
+        // behind the row lock — so this is about not offering a dead control.
+        {move || {
+            if maximum_cents > 0 {
+                view! { <PaymentForm order_id maximum_cents today record /> }.into_any()
+            } else {
+                view! { <p class="notice">"This order is paid in full."</p> }.into_any()
+            }
         }}
 
         {move || {

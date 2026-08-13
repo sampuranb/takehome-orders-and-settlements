@@ -9,6 +9,7 @@ pub mod app;
 pub mod auth;
 pub mod error;
 pub mod orders;
+pub mod payments;
 
 // Re-exported at the crate root so `main.rs` keeps importing the document shell
 // and the application root from one place, unchanged, as the app module grows.

@@ -93,6 +93,19 @@ pub enum AppError {
     #[error("This order has payments recorded against it and can no longer be changed.")]
     OrderHasPayments,
 
+    /// The payment would take the order past its total.
+    ///
+    /// Carries the largest payment that *would* be accepted, because "too much"
+    /// on its own makes the user guess. `0` is a meaningful value and the most
+    /// common one: the order is already settled, so no further payment is
+    /// possible at all.
+    ///
+    /// The maximum is read inside the same transaction that holds the order's
+    /// row lock, so it is the true remaining balance at the moment of refusal
+    /// rather than a number that was already stale when it was computed.
+    #[error("{}", overpayment_message(*maximum_cents))]
+    PaymentExceedsAmountDue { maximum_cents: i64 },
+
     /// The server function framework failed before or after our code ran —
     /// a network drop mid-submit, or a response it could not decode. Carries
     /// the framework's own description because there is nothing server-side to
@@ -114,6 +127,7 @@ impl AppError {
             Self::AmountOutOfRange => "AMOUNT_OUT_OF_RANGE",
             Self::NotFound => "NOT_FOUND",
             Self::OrderHasPayments => "ORDER_HAS_PAYMENTS",
+            Self::PaymentExceedsAmountDue { .. } => "PAYMENT_EXCEEDS_AMOUNT_DUE",
             Self::Transport(_) => "TRANSPORT",
         }
     }
@@ -145,8 +159,11 @@ impl AppError {
             Self::AuthRejected(_) | Self::ValidationFailed(_) | Self::AmountOutOfRange => 400,
             Self::NotFound => 404,
             // Not a `400`: the request is well formed and the caller is
-            // entitled to make it. The order's own state is what refuses.
-            Self::OrderHasPayments => 409,
+            // entitled to make it. The order's own state is what refuses, and
+            // the same request could succeed against the same order at another
+            // moment — which is what makes it a conflict rather than a bad
+            // request.
+            Self::OrderHasPayments | Self::PaymentExceedsAmountDue { .. } => 409,
         }
     }
 }
@@ -189,6 +206,23 @@ fn validation_summary(errors: &[FieldError]) -> String {
                 .join(", ")
         ),
     }
+}
+
+/// Says what the caller can still pay, in the same dollars-and-cents form the
+/// rest of the interface uses.
+///
+/// Zero gets its own sentence. "The most you can pay is $0.00" is technically
+/// the same fact but reads as a broken template; the order is settled, and
+/// saying so is more useful than restating the arithmetic.
+fn overpayment_message(maximum_cents: i64) -> String {
+    if maximum_cents <= 0 {
+        return "This order is already paid in full.".to_string();
+    }
+
+    format!(
+        "That is more than is still owed. The most you can pay is {}.",
+        crate::app::format_cents(maximum_cents)
+    )
 }
 
 /// Lets `#[server]` functions return `Result<T, AppError>` directly instead of

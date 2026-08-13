@@ -103,6 +103,7 @@ cannot serve.
 | `POST` | `/api/delete_order*` | Server function: delete an order and its line items |
 | `POST` | `/api/list_orders*` | Server function: the caller's orders with derived status |
 | `POST` | `/api/get_order*` | Server function: one order with its line items |
+| `POST` | `/api/record_payment*` | Server function: record a payment against an order (JSON body) |
 | `GET` | `/pkg/*` | Hydration bundle and stylesheet |
 
 Application pages are server-rendered and then hydrated. Unmatched paths return
@@ -195,6 +196,41 @@ this application stores no time zone for a user to be correct relative to.
 `derive_order_status` takes today as a parameter rather than reading a clock, so
 every branch is reachable from a test without waiting for a date to arrive.
 
+## Payments
+
+A payment is a row in `payments`, never an edit to the order. The order keeps
+its total; how much has been paid is the sum of its payments, and the amount due
+is the difference. Nothing about an order's settlement is stored on the order.
+
+The one rule that cannot be expressed as a constraint is that payments must not
+exceed the total. A `CHECK` sees a single row, and this invariant spans every
+row for the order, so it is held by a transaction instead. `record_payment_transaction`
+in `src/payments.rs` does exactly four things, in this order:
+
+1. `SELECT ... FOR UPDATE` the order row (`lock_owned_order`, which also scopes
+   it to the owner, so a stranger's payment fails as `404` rather than `403`)
+2. read the order total and the sum of its existing payments **on that same
+   connection**, inside the same transaction
+3. compare, and refuse with `409 PAYMENT_EXCEEDS_AMOUNT_DUE` — carrying the
+   largest payment that would still be accepted, so "too much" does not make the
+   user guess
+4. insert, then commit
+
+The lock is on `orders`, but the row it protects is in `payments`. That is the
+point: two concurrent final payments have no row in common to contend over, so
+the order row stands in as the lock for the whole set. Under READ COMMITTED the
+second transaction blocks at step 1, and when it proceeds, its next statement
+sees the first payment. Both orderings end with the same total.
+
+`tests/payments.rs` asserts this rather than describing it: two simultaneous
+final payments on a multi-threaded runtime produce exactly one success and one
+refusal, and six simultaneous $250 payments against a $1,000 order produce
+exactly four acceptances.
+
+Once an order has any payment, it can no longer be edited or deleted. That check
+runs inside the same transaction, after the same lock, so it cannot be raced
+either.
+
 ## Third-party assets
 
 `style/main.css` begins with [Pico CSS](https://picocss.com) v2.1.1, vendored
@@ -221,6 +257,11 @@ the all-or-nothing write — and a fake would only re-assert what the test file
 already believes. Each test writes under an owner id no other test uses, so they
 run in parallel and clean up only their own rows.
 
+`tests/payments.rs` needs the real database for the same reason, and then some:
+two of its cases run on a multi-threaded runtime and issue genuinely concurrent
+payments, which is the only way to observe whether the row lock does what the
+transaction claims. A mocked pool would prove nothing about `FOR UPDATE`.
+
 `tests/auth.rs` goes the other way and drives the Better Auth contract against
 `wiremock` rather than the live service, because the cases that matter most are
 the ones a healthy Node process will not produce on demand: an outage, a refused
@@ -243,6 +284,12 @@ The full lifecycle was walked in a browser as well: create, list, open, edit
 save, then a two-step delete that redirects to an empty list. An order dated in
 the past shows **Overdue** without anything having been written to it.
 
+The settlement flow was walked in a browser too, on a $1,000 order: $400 leaves
+it **Partially paid** with $600 due and replaces the edit and delete controls
+with the reason they are gone; $700 is refused in place with "The most you can
+pay is $600.00."; $600 settles it to **Paid**, $0.00 due, with the payment form
+replaced by a statement that nothing is owed.
+
 ## Current status
 
 Implemented:
@@ -261,10 +308,12 @@ Implemented:
 - A dynamic line-item editor with a live total computed by the server's own code
 - Order list, detail, edit, and delete, each scoped to the owner
 - Derived status: pending, partially paid, paid, and overdue
+- Payments and amount due, with overpayment refused under concurrency
+- Orders locked against edit and delete once money is recorded against them
 
 Not yet implemented:
 
-- Payments, amount due, and payment history
+- Payment history on the order detail page
 - Dashboard and status filter; REST API
 - Deployment and the deployed URL
 
